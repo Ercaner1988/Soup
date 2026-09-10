@@ -1,0 +1,32 @@
+name: startup-probe
+
+# THROWAWAY. Fork-only branch (`probe/startup-cost`), never proposed upstream.
+# Runs scripts/startup_cost_probe.py on the three CI platforms so a startup
+# measurement taken on one Windows laptop can be checked against the runners the
+# project actually uses. Core deps only (`pip install -e .`, no [dev], no
+# torch) — that is the install a user gets, and the measurement is about the
+# pure-Python layer.
+
+on:
+  push:
+    branches: [probe/startup-cost]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e .
+      - name: Measure startup cost
+        run: python scripts/startup_cost_probe.py
