@@ -74,6 +74,9 @@ MAINTAINERS = {"README.tr.md": "@Ercaner1988"}
 #: comparison -- see the class docstring, lock 3. Matched on README.md's own
 #: title at each position; a translation is free to title its own copy
 #: differently (`## Yenilikler` etc. already isn't policed either way).
+#: Exemption covers content, never existence: the section-count check in
+#: structure_problems() runs unconditionally, before the per-section loop, so
+#: an exempt section that is deleted outright still fails (#1013 review).
 EXEMPT_SECTIONS = {"What's New"}
 
 _STAMP_RE = re.compile(r"<!--\s*synced-from:\s*README\.md\s+sha256:([0-9a-f]{64})\s*-->")
@@ -549,3 +552,26 @@ class TestExemptSectionsDoNotGateOnTranslation:
         _edit(tree / "README.tr.md", "Tepe 3.32 GB", "Tepe 9.99 GB")
         problems = structure_problems(tree)
         assert any("number missing ['3.32']" in p for p in problems), problems
+
+    def test_dropping_the_exempt_section_still_fails_the_count(self, tree):
+        """#1013 review: exemption covers content, never existence. The exempt
+        section vanishing entirely must still trip the section-count check --
+        that check runs before the per-section loop and is not skippable."""
+        _edit(tree / "README.tr.md", "## Yenilikler\n", "")
+        problems = structure_problems(tree)
+        assert "README.tr.md: 1 `## ` sections, README.md has 2" in problems, problems
+
+    def test_widening_the_exemption_list_silences_a_real_drift(self, tree, monkeypatch):
+        """#1013 review, the requested mutation: widening EXEMPT_SECTIONS by one
+        entry must visibly stop catching a drift that is caught today, proving
+        the list is exactly the lever that turns detection off -- not incidental
+        to it, and not something that can be widened quietly."""
+        _edit(tree / "README.tr.md", "https://discord.gg/x", "https://discord.gg/y")
+        assert structure_problems(tree) != []  # caught today, with the narrow list
+
+        import sys
+
+        monkeypatch.setattr(
+            sys.modules[__name__], "EXEMPT_SECTIONS", EXEMPT_SECTIONS | {"Support"}
+        )
+        assert structure_problems(tree) == []  # same drift, silenced by widening it
