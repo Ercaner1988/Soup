@@ -27,14 +27,17 @@ jobs:
     #
     # GitHub does not grant id-token: write to a pull_request run triggered
     # from a fork, regardless of what this file requests -- a platform
-    # restriction, not a CodSpeed one. Concretely: a PR from a branch of
-    # this repository gets a CodSpeed comment; a PR from a fork still runs
-    # this job and its test still passes or fails normally, but the OIDC
-    # step has nothing to authenticate with, so no comparison is posted.
-    # Most contributions here come from forks, so in practice this gate is
-    # live for maintainer-branch PRs and silent on the rest until someone
-    # decides a CODSPEED_TOKEN secret (and the trust it implies for a
+    # restriction, not a CodSpeed one. Observed on #1086 itself, a fork PR:
+    # the job's GITHUB_TOKEN listed only `Contents: read` and `Metadata: read`,
+    # and the upload failed 401. So a PR from a branch of this repository
+    # gets a CodSpeed comment; a fork PR cannot. Most contributions here come
+    # from forks, so this gate is live for maintainer-branch PRs only, until
+    # someone decides a CODSPEED_TOKEN secret (and the trust it implies for a
     # fork's workflow run) is worth it.
+    #
+    # The two steps below make that visible instead of red: on a fork PR the
+    # CodSpeed step is skipped and the test runs as plain pytest, so the job
+    # stays green and its step name says why nothing was reported.
     permissions:
       contents: read
       id-token: write
@@ -46,7 +49,12 @@ jobs:
       # Core dependencies only, no torch/transformers/[dev]'s heavier extras
       # -- the import this benchmarks is paid on every install, ML or not.
       - run: pip install -e . pytest pytest-codspeed
-      - uses: CodSpeedHQ/action@v5
+      - name: Benchmark and report to CodSpeed
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
           run: pytest tests/test_cli_import_benchmark.py --codspeed -o addopts=""
+      - name: Fork PR -- no OIDC token, run the test without reporting to CodSpeed
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: pytest tests/test_cli_import_benchmark.py -o addopts=""
