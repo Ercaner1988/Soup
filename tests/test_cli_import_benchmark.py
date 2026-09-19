@@ -15,11 +15,11 @@ absolute milliseconds -- OS and import-metadata caches stay warm across
 iterations here, and interpreter startup itself isn't part of what's timed.
 What it tracks is the same import graph's cost moving, relatively, PR to PR.
 
-Deleting only this one leaf, not `soup_cli` wholesale, is deliberate: other
-already-imported `soup_cli` modules keep their existing reference to the
-parent `soup_cli.config` package, and the import machinery updates that
-package's `schema` attribute to the freshly-built module on each iteration,
-so nothing else in the test session is left pointing at a stale module.
+The original module is put back after every iteration, and that is load
+bearing: a re-import builds a *new* `SoupConfig` class, while
+`soup_cli.config.loader` keeps the old one, so leaving the new module in
+`sys.modules` makes every later `isinstance(load_config(...), SoupConfig)` in
+the session false (first CI run of #1086: `test_v07112.py`, 9 of 9 cells).
 """
 
 from __future__ import annotations
@@ -31,9 +31,24 @@ _TARGET = "soup_cli.config.schema"
 
 
 def _reimport_schema() -> None:
-    sys.modules.pop(_TARGET, None)
-    importlib.import_module(_TARGET)
+    package = importlib.import_module("soup_cli.config")
+    original = importlib.import_module(_TARGET)
+    del sys.modules[_TARGET]
+    try:
+        importlib.import_module(_TARGET)
+    finally:
+        sys.modules[_TARGET] = original
+        package.schema = original
 
 
 def test_config_schema_import_cost(benchmark) -> None:
     benchmark(_reimport_schema)
+
+
+def test_the_benchmark_leaves_the_original_schema_module_in_place() -> None:
+    """Fails if the restore above is dropped: the rest of the session would see
+    a different `SoupConfig` than the one `soup_cli.config.loader` builds."""
+    before = importlib.import_module(_TARGET)
+    _reimport_schema()
+    assert sys.modules[_TARGET] is before
+    assert importlib.import_module("soup_cli.config").schema is before

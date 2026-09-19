@@ -46,6 +46,7 @@ jobs:
       # Core dependencies only, no torch/transformers/[dev]'s heavier extras
       # -- the import this benchmarks is paid on every install, ML or not.
       - run: pip install -e . pytest pytest-codspeed
-      - uses: CodSpeedHQ/action@v3
+      - uses: CodSpeedHQ/action@v5
         with:
+          mode: simulation
           run: pytest tests/test_cli_import_benchmark.py --codspeed -o addopts=""
