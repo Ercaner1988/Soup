@@ -1,11 +1,40 @@
 name: CodSpeed
 
-# Deliberately its own workflow, not a job in ci.yml (#1065): ci.yml's jobs
-# are this repo's required checks, and a third-party benchmarking service
-# must never be able to redden one. This workflow is not added to the
-# required set by this change, and shouldn't be without a separate decision.
-# If CodSpeed is slow, down, or changes its free-tier terms, this job can
-# still fail on a real pytest error, but nothing about it blocks a merge.
+# Deliberately its own workflow, not a job in ci.yml (#1065): ci.yml's jobs are
+# this repo's required checks, and a third-party benchmarking service must never
+# be able to redden one. This workflow is not in the required set and must not
+# be added to it: on a fork PR it fails on purpose (below), and that has to
+# block nothing.
+#
+# WHAT IT MEASURES: a warm-process re-import of soup_cli.config.schema
+# (tests/test_cli_import_benchmark.py), NOT the cold start #780 measured
+# (interpreter start plus every import). The numbers are not comparable with
+# #780's table, and a new transitive import is barely visible in them;
+# tests/test_cli_startup_is_light.py is the guard for that.
+#
+# PERMISSIONS. Widen only by arguing with this list:
+#   contents: read   actions/checkout needs it to fetch the PR head. Nothing in
+#                    this workflow writes to the repository.
+#   id-token: write  CodSpeedHQ/action exchanges a short-lived GitHub OIDC token
+#                    for its upload credentials. This is public-repo auth, so no
+#                    CODSPEED_TOKEN secret is stored. Without it the upload has
+#                    nothing to authenticate with.
+#   pull-requests: write is deliberately NOT requested. The PR comment is posted
+#                    by the separately installed CodSpeed GitHub App under the
+#                    App's own permissions, not by this token.
+#
+# FORK PRs FAIL HERE, LOUDLY, ON PURPOSE. GitHub does not grant id-token: write
+# to a pull_request run triggered from a fork, whatever this file requests. That
+# is a platform restriction, not a CodSpeed one; observed on #1086, a fork PR:
+# the job's GITHUB_TOKEN listed only `Contents: read` and `Metadata: read`, and
+# the upload failed 401. The benchmark still runs, the upload cannot
+# authenticate, the job goes red, and the last step says why. This is a stated
+# limitation and not a skip condition on purpose: a green tick that reported
+# nothing would be worse than a red one that explains itself. Most contributions
+# here come from forks, so in practice comparisons appear for same-repository
+# branch PRs only, until someone decides a CODSPEED_TOKEN secret, and the trust
+# it implies for a fork's workflow run, is worth it. If CodSpeed ever accepts
+# fork uploads, this job goes green with no change here.
 on:
   push:
     branches: [main]
@@ -19,25 +48,6 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    # contents: read is checkout. id-token: write lets CodSpeedHQ/action mint
-    # a short-lived OIDC token for CodSpeed's backend -- public-repo auth,
-    # no CODSPEED_TOKEN secret stored here. Neither grants pull-requests:
-    # write: the PR comment is posted by the separately installed CodSpeed
-    # GitHub App using its own permissions, not by this workflow's token.
-    #
-    # GitHub does not grant id-token: write to a pull_request run triggered
-    # from a fork, regardless of what this file requests -- a platform
-    # restriction, not a CodSpeed one. Observed on #1086 itself, a fork PR:
-    # the job's GITHUB_TOKEN listed only `Contents: read` and `Metadata: read`,
-    # and the upload failed 401. So a PR from a branch of this repository
-    # gets a CodSpeed comment; a fork PR cannot. Most contributions here come
-    # from forks, so this gate is live for maintainer-branch PRs only, until
-    # someone decides a CODSPEED_TOKEN secret (and the trust it implies for a
-    # fork's workflow run) is worth it.
-    #
-    # The two steps below make that visible instead of red: on a fork PR the
-    # CodSpeed step is skipped and the test runs as plain pytest, so the job
-    # stays green and its step name says why nothing was reported.
     permissions:
       contents: read
       id-token: write
@@ -46,15 +56,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Core dependencies only, no torch/transformers/[dev]'s heavier extras
-      # -- the import this benchmarks is paid on every install, ML or not.
+      # Core dependencies only, no torch/transformers/[dev]'s heavier extras --
+      # the import this benchmarks is paid on every install, ML or not. The
+      # plugin is installed here and not in [dev] on purpose (#1086 review).
       - run: pip install -e . pytest pytest-codspeed
-      - name: Benchmark and report to CodSpeed
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: CodSpeedHQ/action@v5
+      # Pinned to a commit because this is the only third-party action here that
+      # can mint an OIDC token. That commit is the v5.2.1 release; `v5` pointed
+      # at it when this was written.
+      - name: Benchmark (warm-process re-import, not #780's cold start) and report to CodSpeed
+        id: codspeed
+        uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
         with:
           mode: simulation
           run: pytest tests/test_cli_import_benchmark.py --codspeed -o addopts=""
-      - name: Fork PR -- no OIDC token, run the test without reporting to CodSpeed
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        run: pytest tests/test_cli_import_benchmark.py -o addopts=""
+      - name: Say why this fork PR could not report
+        if: failure() && steps.codspeed.outcome == 'failure' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: >-
+          echo "::error title=CodSpeed could not report::This is a fork PR. GitHub does not
+          give a pull_request run from a fork an OIDC token (id-token: write), so the CodSpeed
+          upload could not authenticate. The benchmark ran; nothing was reported. This job is
+          not a required check and blocks nothing."
