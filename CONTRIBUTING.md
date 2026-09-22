@@ -513,6 +513,13 @@ GitHub Actions runs on every push and PR:
   `transformers>=4.36.0,<5.0.0` in `pyproject.toml`; `transformers==4.36.0`
   cannot resolve against the declared `trl` range, so this job does not rewrite
   that pin.
+- **benchmark** (`.github/workflows/codspeed.yml`, #1065): a CodSpeed
+  regression benchmark, its own workflow and not part of the matrix above.
+  On a fork PR it goes red on purpose — GitHub does not grant a `pull_request`
+  run from a fork an OIDC token, so the CodSpeed upload cannot authenticate and
+  the job's last step names the cause. Since most contributions here are fork
+  PRs, expect this red on yours; it is not a required check and blocks
+  nothing.
 
 See `.github/workflows/ci.yml`.
 

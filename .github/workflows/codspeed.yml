@@ -35,6 +35,18 @@ name: CodSpeed
 # branch PRs only, until someone decides a CODSPEED_TOKEN secret, and the trust
 # it implies for a fork's workflow run, is worth it. If CodSpeed ever accepts
 # fork uploads, this job goes green with no change here.
+#
+# THE SAME EXPLANATION FIRES ON `push`, NOT ONLY ON A FORK PR (#1086 review).
+# The 401's reason string ("Repository not found or the user does not have
+# access to it") is identical whether this is a fork PR without an OIDC token,
+# or the CodSpeed GitHub App simply not being installed on this repository --
+# neither this workflow's token nor a maintainer's PAT can tell those apart
+# (`repos/.../installation` and `user/installations` both 401/403 for a
+# non-admin). If the App were never installed, every `push` to `main` would
+# 401 with no annotation attached: a red that explains nothing, which is the
+# same failure this workflow exists to avoid, just inverted. So the last step
+# is not gated to `pull_request`; it explains any reporting failure, on a
+# fork PR or on `main`, with only the fork sentence made conditional.
 on:
   push:
     branches: [main]
@@ -69,10 +81,15 @@ jobs:
         with:
           mode: simulation
           run: pytest tests/test_cli_import_benchmark.py --codspeed -o addopts=""
-      - name: Say why this fork PR could not report
-        if: failure() && steps.codspeed.outcome == 'failure' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+      - name: Say why this run could not report to CodSpeed
+        if: failure() && steps.codspeed.outcome == 'failure'
         run: >-
-          echo "::error title=CodSpeed could not report::This is a fork PR. GitHub does not
-          give a pull_request run from a fork an OIDC token (id-token: write), so the CodSpeed
-          upload could not authenticate. The benchmark ran; nothing was reported. This job is
-          not a required check and blocks nothing."
+          echo "::error title=CodSpeed could not report::The benchmark ran; the upload to
+          CodSpeed could not authenticate, so nothing was reported. This job is not a required
+          check and blocks nothing.${{ (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name != github.repository) && ' This is a
+          fork PR: GitHub does not give a pull_request run from a fork an OIDC token
+          (id-token: write), which is why the upload had nothing to authenticate with.' || '
+          If this is a push to main, either the CodSpeed GitHub App is not installed on this
+          repository, or CodSpeed itself is unreachable/misconfigured -- both look identical
+          from here (repos/.../installation is 401 either way to a non-admin token).' }}"
