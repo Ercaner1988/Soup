@@ -290,6 +290,10 @@ class MLXSFTTrainerWrapper:
             unsupported.append("quantization=8bit (use mlx-community 4bit models)")
         if tcfg.use_galore:
             unsupported.append("GaLore")
+        if getattr(tcfg, "use_lorafa", False):
+            unsupported.append(
+                "training.use_lorafa (LoRA-FA has no MLX implementation)"
+            )
         if tcfg.use_ring_attention:
             unsupported.append("Ring Attention")
         if tcfg.use_flash_attn:
@@ -335,6 +339,21 @@ class MLXSFTTrainerWrapper:
             unsupported.append(
                 f"gradient_checkpointing tier {tcfg.gradient_checkpointing!r} "
                 "(MLX has a single on/off switch; enabling it)"
+            )
+        if getattr(tcfg, "loss_watchdog", False):
+            unsupported.append(
+                "training.loss_watchdog (Soup does not implement the watchdog "
+                "on the MLX callback, which has no stop control)"
+            )
+        if getattr(tcfg, "loss_spike_recovery", False):
+            unsupported.append(
+                "training.loss_spike_recovery "
+                "(spike recovery is driven by the watchdog and the watchdog cannot fire on MLX)"
+            )
+        if getattr(tcfg, "grad_accum_auto_tune", False):
+            unsupported.append(
+                "training.grad_accum_auto_tune "
+                "(there is no VRAM total to measure pressure against on unified memory)"
             )
         if unsupported:
             console.print(

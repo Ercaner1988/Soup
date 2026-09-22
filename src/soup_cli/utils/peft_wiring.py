@@ -127,7 +127,59 @@ def build_lora_config_kwargs(
         kwargs["rank_pattern"] = dict(rank_pattern)
     if alpha_pattern:
         kwargs["alpha_pattern"] = dict(alpha_pattern)
+    # ``use_olora`` is the legacy spelling. Schema validation aligns it to
+    # init_strategy='olora'; retain this defensive read so callers that build a
+    # schema-like config double cannot silently lose the requested method.
+    init_strategy = (
+        "olora"
+        if getattr(lora_cfg, "use_olora", False)
+        else getattr(lora_cfg, "init_strategy", "random")
+    )
+    if init_strategy != "random":
+        kwargs["init_lora_weights"] = init_strategy
+    if init_strategy == "loftq":
+        from soup_cli.utils.loftq_init import build_loftq_config
+
+        kwargs["loftq_config"] = build_loftq_config(
+            loftq_iter=lora_cfg.loftq_iter,
+            loftq_bits=lora_cfg.loftq_bits,
+        )
     return kwargs
+
+
+def build_peft_config_spec(
+    lora_cfg: Any,
+    *,
+    target_modules: Any,
+    task_type: Any,
+    target_parameters: Any = None,
+) -> dict[str, Any]:
+    """Return the PEFT class name and kwargs for the configured adapter.
+
+    VeRA is a distinct PEFT tuner, not a LoRA option. Keeping this branch next
+    to the shared LoRA kwargs is what makes every trainer consume the same
+    method choice instead of silently constructing ordinary LoRA.
+    """
+    if getattr(lora_cfg, "use_vera", False):
+        return {
+            "peft_cls": "VeraConfig",
+            "init_kwargs": {
+                "r": lora_cfg.r,
+                "target_modules": target_modules,
+                "task_type": task_type,
+                "vera_dropout": lora_cfg.dropout,
+                "bias": "none",
+            },
+        }
+    return {
+        "peft_cls": "LoraConfig",
+        "init_kwargs": build_lora_config_kwargs(
+            lora_cfg,
+            target_modules=target_modules,
+            target_parameters=target_parameters,
+            task_type=task_type,
+        ),
+    }
 
 
 def build_lora_config(
@@ -137,22 +189,22 @@ def build_lora_config(
     task_type: Any,
     target_parameters: Any = None,
 ) -> Any:
-    """Build a PEFT ``LoraConfig`` through the single shared kwargs path.
+    """Build the configured PEFT adapter through the single shared path.
 
     Keeping the PEFT import inside this function preserves Soup's lazy-import
     boundary while ensuring every trainer consumes new shared LoRA fields such
     as ``rank_pattern`` and ``alpha_pattern`` automatically.
     """
-    from peft import LoraConfig
+    import peft
 
-    return LoraConfig(
-        **build_lora_config_kwargs(
-            lora_cfg,
-            target_modules=target_modules,
-            target_parameters=target_parameters,
-            task_type=task_type,
-        )
+    spec = build_peft_config_spec(
+        lora_cfg,
+        target_modules=target_modules,
+        target_parameters=target_parameters,
+        task_type=task_type,
     )
+    config_cls = getattr(peft, spec["peft_cls"])
+    return config_cls(**spec["init_kwargs"])
 
 
 def apply_pre_lora_patches(model: Any, base: str) -> None:
@@ -251,6 +303,12 @@ def attach_loraplus_optimizer(trainer: Any, tcfg: Any) -> bool:
             "training.use_galore: LoRA+ tunes LoRA A/B matrices while GaLore "
             "projects full-parameter gradients. Enable one, not both."
         )
+    if getattr(tcfg, "use_lorafa", False):
+        raise ValueError(
+            "training.loraplus_lr_ratio is mutually exclusive with "
+            "training.use_lorafa: LoRA+ tunes LoRA A/B matrices while LoRA-FA "
+            "freezes LoRA A matrices. Enable one, not both."
+        )
 
     from peft import PeftModel
     from peft.optimizers import create_loraplus_optimizer
@@ -277,6 +335,169 @@ def attach_loraplus_optimizer(trainer: Any, tcfg: Any) -> bool:
         **optimizer_kwargs,
     )
     return True
+
+
+def attach_lorafa_optimizer(trainer: Any, tcfg: Any) -> bool:
+    """Attach a PEFT LoRA-FA optimizer when ``training.use_lorafa`` is set.
+
+    LoRA-FA (Frozen-A LoRA, arXiv:2308.03303) freezes the LoRA A matrices and
+    only updates the B matrices (#725). Freezing A eliminates the need to retain
+    input activations for backpropagating through A, cutting adapter-rank
+    activation memory retention substantially.
+
+    Like LoRA+, LoRA-FA is not a ``TrainingArguments`` field — it belongs to
+    PEFT's optimizer construction (``create_lorafa_optimizer``). Assigning
+    ``trainer.optimizer`` post-construction is respected because
+    ``Trainer.create_optimizer`` builds one only when ``self.optimizer is None``,
+    and the scheduler is still derived from it with the configured warmup/schedule.
+
+    Weight decay is passed directly through PEFT's ``weight_decay`` argument.
+    The optimizer uses the learning rate from ``trainer.args.learning_rate``, and
+    betas/eps from ``Trainer.get_optimizer_cls_and_kwargs`` are preserved.
+    Conflicting configurations (GaLore, LoRA+, or a non-LoRA run) are rejected
+    with explicit error messages.
+
+    Returns ``True`` when an optimizer was attached, ``False`` otherwise.
+    """
+    if not getattr(tcfg, "use_lorafa", False):
+        return False
+
+    # GaLore projects full-parameter gradients; LoRA-FA tunes LoRA B matrices.
+    # They cannot both own the optimizer — fail loudly rather than let this
+    # silently override the GaLore optimizer set on TrainingArguments.
+    if getattr(tcfg, "use_galore", False):
+        raise ValueError(
+            "training.use_lorafa is mutually exclusive with "
+            "training.use_galore: LoRA-FA tunes LoRA B matrices while GaLore "
+            "projects full-parameter gradients. Enable one, not both."
+        )
+
+    # LoRA+ provides separate learning rates for A and B; LoRA-FA freezes A.
+    # They cannot be combined on the same run.
+    if getattr(tcfg, "loraplus_lr_ratio", None) is not None:
+        raise ValueError(
+            "training.use_lorafa is mutually exclusive with "
+            "training.loraplus_lr_ratio: LoRA-FA freezes LoRA A matrices while "
+            "LoRA+ tunes them with separate learning rates. Enable one, not both."
+        )
+
+    # VeRA trains scaling vectors, not LoRA B matrices; create_lorafa_optimizer
+    # finds no trainable lora_* parameters and silently degrades to plain AdamW.
+    if getattr(getattr(tcfg, "lora", None), "use_vera", False):
+        raise ValueError(
+            "training.use_lorafa is mutually exclusive with training.lora.use_vera: "
+            "VeRA freezes random projection matrices and trains scaling vectors, "
+            "so peft's create_lorafa_optimizer finds no trainable lora_* matrices "
+            "and silently degrades to plain AdamW."
+        )
+
+    # LoRA-FA optimizes gradients using an AdamW projection in LoraFAOptimizer.
+    # An explicitly configured non-AdamW optimizer would be silently overridden.
+    opt_name = getattr(tcfg, "optimizer", None)
+    if opt_name is not None and opt_name not in (
+        "adamw_torch",
+        "adamw",
+        "adamw_hf",
+        "adamw_torch_fused",
+    ):
+        raise ValueError(
+            f"training.use_lorafa uses an AdamW-based gradient projection and is "
+            f"incompatible with training.optimizer={opt_name!r}. Leave optimizer unset "
+            f"(defaulting to adamw) or use 'adamw_torch'."
+        )
+
+    from peft import PeftModel
+    from peft.optimizers import create_lorafa_optimizer
+    from transformers import Trainer
+
+    model = trainer.model
+    if not isinstance(model, PeftModel):
+        raise ValueError(
+            "training.use_lorafa requires a LoRA (PEFT) model, but the "
+            "active run has no adapter. Add a lora config or disable "
+            "use_lorafa."
+        )
+
+    r = None
+    lora_alpha = None
+    if hasattr(model, "peft_config") and model.peft_config:
+        active = getattr(model, "active_adapter", None)
+        if isinstance(active, str) and active in model.peft_config:
+            adapter_cfg = model.peft_config[active]
+        else:
+            adapter_cfg = next(iter(model.peft_config.values()))
+        r = getattr(adapter_cfg, "r", None)
+        lora_alpha = getattr(adapter_cfg, "lora_alpha", None)
+    if r is None and hasattr(tcfg, "lora") and tcfg.lora is not None:
+        r = getattr(tcfg.lora, "r", None)
+        lora_alpha = getattr(tcfg.lora, "alpha", None)
+    if r is None or lora_alpha is None:
+        raise ValueError(
+            "training.use_lorafa requires explicit lora rank and alpha. "
+            "Configure training.lora.r and training.lora.alpha or ensure the "
+            "PEFT model provides them."
+        )
+
+    _, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(trainer.args)
+    optimizer = create_lorafa_optimizer(
+        model=model,
+        r=int(r),
+        lora_alpha=int(lora_alpha),
+        lr=trainer.args.learning_rate,
+        weight_decay=trainer.args.weight_decay,
+    )
+    if "betas" in optimizer_kwargs:
+        for group in optimizer.param_groups:
+            group["betas"] = optimizer_kwargs["betas"]
+    if "eps" in optimizer_kwargs:
+        for group in optimizer.param_groups:
+            group["eps"] = optimizer_kwargs["eps"]
+
+    _fixup_lorafa_state_dict_devices(optimizer)
+    trainer.optimizer = optimizer
+    return True
+
+
+def _fixup_lorafa_state_dict_devices(optimizer: Any) -> Any:
+    """Ensure tensors in optimizer.state are cast to their parameter's device on load_state_dict.
+
+    `LoraFAOptimizer` keys adapter states by string names rather than parameter
+    references or integer IDs (e.g. 'base_model.model...lora'). When PyTorch's
+    `torch.optim.Optimizer.load_state_dict` executes during checkpoint resume, its
+    per-parameter device-casting loop checks `id_map` which only contains integer
+    parameter IDs. As a result, states indexed by string name (such as `exp_avg_B`
+    and `exp_avg_sq_B`) remain on the deserialized storage device (typically CPU),
+    causing a device mismatch runtime error on GPU when `opt.step()` runs.
+
+    This hook casts all string-keyed tensors in `optimizer.state` to the target
+    parameter device whenever `load_state_dict` is called.
+    """
+    import torch
+
+    def _cast_state_tensors(opt: Any) -> None:
+        for group in opt.param_groups:
+            params = group.get("params", [])
+            names = group.get("names", [])
+            param_list = []
+            for p, n in zip(params, names):
+                if "lora" in n:
+                    param_list.append(p)
+                    if len(param_list) == 2:
+                        name = n[: n.find("lora")] + "lora"
+                        target_device = param_list[1].device  # LoRA B parameter
+                        if name in opt.state:
+                            for k, v in list(opt.state[name].items()):
+                                if isinstance(v, torch.Tensor) and v.device != target_device:
+                                    opt.state[name][k] = v.to(target_device)
+                        param_list = []
+                else:
+                    if n in opt.state:
+                        for k, v in list(opt.state[n].items()):
+                            if isinstance(v, torch.Tensor) and v.device != p.device:
+                                opt.state[n][k] = v.to(p.device)
+
+    optimizer.register_load_state_dict_post_hook(_cast_state_tensors)
+    return optimizer
 
 
 def apply_lisa_setup(model: Any, tcfg: Any, console: Any = None) -> bool:
