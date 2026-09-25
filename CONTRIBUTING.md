@@ -515,11 +515,12 @@ GitHub Actions runs on every push and PR:
   that pin.
 - **benchmark** (`.github/workflows/codspeed.yml`, #1065): a CodSpeed
   regression benchmark, its own workflow and not part of the matrix above.
-  On a fork PR it goes red on purpose — GitHub does not grant a `pull_request`
-  run from a fork an OIDC token, so the CodSpeed upload cannot authenticate and
-  the job's last step names the cause. Since most contributions here are fork
-  PRs, expect this red on yours; it is not a required check and blocks
-  nothing.
+  The job is **skipped** everywhere until the repository variable
+  `CODSPEED_ENABLED` is `true` (set once the CodSpeed GitHub App is installed),
+  and always on fork PRs — GitHub does not grant a `pull_request` run from a
+  fork an OIDC token, so the upload could not authenticate. Since most
+  contributions here are fork PRs, expect "skipped" on yours; it is not a
+  required check and blocks nothing.
 
 See `.github/workflows/ci.yml`.
 
