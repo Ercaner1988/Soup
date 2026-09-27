@@ -5,20 +5,24 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-# Buffer bounds live with the streaming planner so the schema bound and the
-# runtime validator's message can never disagree (layer_stream has no torch).
-from soup_cli.utils.layer_stream import (
+# Stream-buffer, read-ahead and noise-floor bounds come from a dependency-free
+# leaf that layer_stream, async_disk_source and ship_verdict re-export, so the
+# schema bound and the runtime validator's message are the same object, and the
+# schema does not pull those runtimes onto the `soup version` path (#780).
+from soup_cli.utils.config_bounds import (
     DEFAULT_STREAM_BUFFERS,
     DEFAULT_STREAM_READ_AHEAD,
+    MAX_NOISE_FLOOR_RUNS,
     MAX_STREAM_BUFFERS,
     MAX_STREAM_READ_AHEAD,
+    MIN_NOISE_FLOOR_RUNS,
     MIN_STREAM_BUFFERS,
     MIN_STREAM_READ_AHEAD,
 )
-from soup_cli.utils.layer_stream import (
+from soup_cli.utils.config_bounds import (
     ROLLOUT_STREAM_TASKS as _STREAM_ROLLOUT_TASKS,
 )
-from soup_cli.utils.layer_stream import (
+from soup_cli.utils.config_bounds import (
     SUPPORTED_STREAM_TASKS as _STREAM_SUPPORTED_TASKS,
 )
 
@@ -28,14 +32,6 @@ from soup_cli.utils.long_context import LONGROPE_REFUSAL
 
 # Stdlib-only structural check shared by every regex a config can carry.
 from soup_cli.utils.safe_regex import check_config_regex
-
-# Noise-floor bounds live with the ship verdict so the schema bound and the
-# `--noise-floor` CLI validator can never disagree (ship_verdict has no torch,
-# same reasoning as stream_buffers importing its bounds from layer_stream).
-from soup_cli.utils.ship_verdict import (
-    MAX_NOISE_FLOOR_RUNS,
-    MIN_NOISE_FLOOR_RUNS,
-)
 
 # v0.39.0 Part C — per-pattern LoRA rank/alpha bounds
 _MAX_LORA_RANK_PATTERN_KEYS = 256
