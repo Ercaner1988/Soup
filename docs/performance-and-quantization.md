@@ -6,6 +6,7 @@
 
 **Contents:**
 
+- [Experimental CUDA graph decoding](#experimental-cuda-graph-decoding)
 - [Quantization-Aware Training (QAT)](#quantization-aware-training-qat)
 - [Experimental QuEST mixed W4/A4+A16 route](#experimental-quest-mixed-w4a4a16-route)
 - [FP8 Training (Ada+)](#fp8-training-ada)
@@ -31,6 +32,52 @@
 - [Quant Menu II + Export Pipeline (v0.53.1)](#quant-menu-ii--export-pipeline-v0531)
 
 ---
+
+## Experimental CUDA graph decoding
+
+`soup infer` and `soup bench infer` accept `--cuda-graphs`. On a resident Qwen2 or Llama model,
+optionally with one LoRA adapter from `soup train`, generation replays CUDA graphs instead of
+launching every kernel from Python. The default path is unchanged.
+
+```bash
+soup infer --model ./output --input prompts.jsonl --output answers.jsonl --cuda-graphs
+soup bench infer ./model --backend transformers --max-tokens 128 --cuda-graphs
+```
+
+Measured on an RTX 5070 Laptop (Windows, unpinned, fresh processes, A-B-B-A-B-A) with
+Qwen2.5-1.5B-Instruct in FP16, 128 greedy tokens per request: the slowest run with the flag was
+**2.9x** the fastest run without it (60.1 vs 20.7 tok/s), and **2.8x** under an unmerged LoRA
+(49.2 vs 17.8 tok/s), with identical token IDs on every request and +42 MiB of reserved VRAM.
+`soup infer` over 24 prompts of varied length, model load and compile included, took 96-102 s with
+the flag against 131-282 s without. Without the flag the run-to-run spread is large (13.5-20.7 tok/s):
+the decode is bound by the host launching ~1,200 kernels per token, and Windows moves that thread
+between the hybrid CPU's fast and slow cores; with the flag the spread is 4%. The record is
+[`benchmarks/gate-v0.76.0-cuda-graph-decode.md`](../benchmarks/gate-v0.76.0-cuda-graph-decode.md).
+
+- **Cold start is slower.** Before the first row, Soup runs one greedy warm-up on your longest
+  prompt, which compiles and captures the graph (about 8-10 s on that card) and sizes the static
+  cache once for the whole batch. A one-prompt run can take longer overall. The summary panel's
+  `Duration` and `Throughput` start after the warm-up.
+- **Outputs are the same.** The flag changes no precision, sampling or stopping rule; sampled rows
+  use the temperature you asked for, and the warm-up is greedy so it consumes no sampling RNG. A
+  LoRA adapter stays unmerged, exactly as without the flag.
+- **Supported:** stock Qwen2/Llama classes, one CUDA GPU, unquantized weights, and at most one
+  active plain LoRA adapter. Anything else (quantization, CPU/disk offload, layer streaming, DoRA
+  or other LoRA variants, several adapters, flash attention, ASR) is refused before any output is
+  written, and every refusal ends with `Omit --cuda-graphs`.
+- **Needs PyTorch >= 2.14.** It uses private PyTorch compiler APIs validated on 2.14.0 (it fixes an
+  accounting defect in the stock `cudagraphs` backend that otherwise clones every weight into the
+  graph pool). Older versions, or a changed API, are refused with a one-line message.
+- **Not in `soup chat` or `soup serve`.** A chat history grows every turn, and a static cache that
+  grows recompiles every turn.
+- **Unmeasured:** `--max-tokens` far above 128 (each K/V update costs an extra copy per step, growing
+  with prompt + max_tokens), Linux/macOS, batch sizes above 1, and architectures other than Qwen2.
+  Over a 1024-prompt batch the graph tree re-records about once per three rows without any eager
+  fallback or memory growth.
+
+If generation fails with the flag on, Soup stops with `Generation failed with --cuda-graphs: ...`,
+keeps the rows already written, and names the way out. Run the same command without
+`--cuda-graphs`.
 
 ## Quantization-Aware Training (QAT)
 
@@ -376,7 +423,7 @@ training:
 soup train --config soup.yaml
 ```
 
-**How it works.** LoRA adapters + their gradients + optimizer state stay resident in VRAM (they are small). The frozen base lives in CPU RAM, page-locked when the machine allows it, and is streamed: each decoder layer is copied into one of two pre-allocated VRAM buffers on a dedicated CUDA stream while the previous layer is still computing, so the load overlaps the compute. Vocabulary-sized `embed_tokens` and an untied `lm_head` use one additional shared slot: the embedding is loaded for the model input, then the same allocation is reused for the output head after the last decoder layer. Each decoder layer is read **twice** per step — once in the forward pass and once when the backward pass recomputes it — because `dL/dx = Wᵀ · dL/dy` needs the weights to reach the layers below. That is physics, not an implementation detail, and it is why streaming costs time.
+**How it works.** LoRA adapters + their gradients + optimizer state stay resident in VRAM (they are small). The frozen base lives in CPU RAM, page-locked when the machine allows it, and is streamed: each decoder layer is copied into one of two pre-allocated VRAM buffers on a dedicated CUDA stream while the previous layer is still computing, so the load overlaps the compute. Vocabulary-sized `embed_tokens` and an untied `lm_head` use one additional shared slot: the embedding is loaded for the model input, then the same allocation is reused for the output head after the last decoder layer, and the embedding is reloaded into it at the tail of that step's backward pass so the copy overlaps the remaining compute instead of blocking the next step's first lookup. Each decoder layer is read **twice** per step — once in the forward pass and once when the backward pass recomputes it — because `dL/dx = Wᵀ · dL/dy` needs the weights to reach the layers below. That is physics, not an implementation detail, and it is why streaming costs time.
 
 **Qwen3.8-Flash-Next / Qwen4-Exp PLE.** The frozen PLE N-gram table is not a
 decoder-layer weight for storage purposes: putting it in the PLE layer's shard
@@ -1018,7 +1065,7 @@ training:
   gradient_checkpointing: true  # Required for long sequences
 
   # Long-context (128k+ tokens)
-  rope_scaling_type: dynamic  # RoPE scaling: linear, dynamic, yarn, longrope
+  rope_scaling_type: dynamic  # RoPE scaling: linear, dynamic, yarn, llama3
   # use_ring_attention: true  # Sequence parallelism across GPUs
 
 data:

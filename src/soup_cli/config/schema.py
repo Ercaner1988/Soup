@@ -26,6 +26,10 @@ from soup_cli.utils.config_bounds import (
     SUPPORTED_STREAM_TASKS as _STREAM_SUPPORTED_TASKS,
 )
 
+# The longrope refusal (#1239) lives with the runtime so config load and
+# apply_long_context_config say the same thing (long_context has no torch).
+from soup_cli.utils.long_context import LONGROPE_REFUSAL
+
 # Stdlib-only structural check shared by every regex a config can carry.
 from soup_cli.utils.safe_regex import check_config_regex
 
@@ -1860,19 +1864,23 @@ class TrainingConfig(BaseModel):
             "(v0.71.12 #146)"
         ),
     )
-    # Part E — EBFT + GDPO
+    # Part E — EBFT + GDPO. ebft_variant is refused at config load until the
+    # intended EBFT objective is implemented (#1230); see _refuse_ebft_variant.
     ebft_variant: Optional[Literal["structured", "strided"]] = Field(
         default=None,
         description=(
-            "Energy-Based FT variant. SFT-task-only; replaces the trainer's "
-            "loss with the selected energy-based objective."
+            "Refused at config load (#1230): EBFT is not yet a distinct "
+            "objective. The added term had no causal shift, so it rewarded "
+            "copying the input token, and shifted it duplicates the "
+            "cross-entropy."
         ),
     )
     ebft_temperature: Optional[float] = Field(
         default=None,
         description=(
             "Sampling temperature for EBFT energy proxy. Bounded "
-            "[1e-4, 100.0]. (v0.52.0)"
+            "[1e-4, 100.0]. Only applies with ebft_variant, which is refused "
+            "at config load (#1230). (v0.52.0)"
         ),
     )
     gdpo_variant: Optional[Literal[
@@ -2687,6 +2695,37 @@ class TrainingConfig(BaseModel):
 
         return validate_ebft_temperature(v)
 
+    @field_validator("ebft_variant", mode="before")
+    @classmethod
+    def _refuse_ebft_variant(cls, v):
+        """#1230 — refuse every non-null ``ebft_variant`` until the intended EBFT
+        objective is implemented from its reference.
+
+        The hook added ``apply_ebft_loss(outputs.logits, inputs["labels"])`` to
+        TRL's cross-entropy, and the kernel scores ``logits[:, t]`` against
+        ``labels[:, t]`` with no causal shift: it rewarded copying the input
+        token. Shifted, the term at temperature 1 is the model's own
+        cross-entropy, so the loss would count it twice. ``mode="before"`` so
+        that every non-null value -- not only the two the ``Literal`` accepts --
+        gets this message instead of one pointing at a refused value. The
+        kernel and the hook in ``utils/ebft_gdpo.py`` stay in place,
+        unreachable; GDPO, which shares that module, is unaffected.
+        """
+        if v is not None:
+            raise ValueError(
+                "training.ebft_variant is refused (#1230): EBFT is not yet a "
+                "distinct objective. The term it adds scores each position's "
+                "logits against that position's own input token, with no "
+                "causal shift, so it rewards copying the input over predicting "
+                "the next token; shifted onto the next token it is the model's "
+                "own cross-entropy again (exactly, at ebft_temperature 1), so "
+                "the loss would count cross-entropy twice. It stays refused "
+                "until the intended EBFT objective is implemented from its "
+                "reference. Remove ebft_variant and ebft_temperature to train "
+                "plain SFT."
+            )
+        return v
+
     @field_validator("label_names")
     @classmethod
     def _validate_label_names(cls, v):
@@ -2899,12 +2938,12 @@ class TrainingConfig(BaseModel):
     )
     # Long-context — RoPE scaling
     rope_scaling_type: Optional[
-        Literal["linear", "dynamic", "yarn", "longrope", "llama3"]
+        Literal["linear", "dynamic", "yarn", "llama3"]
     ] = Field(
         default=None,
         description=(
-            "RoPE scaling method for long-context: linear, dynamic, yarn, longrope, "
-            "llama3 (v0.49.0)."
+            "RoPE scaling method for long-context: linear, dynamic, yarn or llama3 "
+            "(v0.49.0). 'longrope' is refused at config load (#1239)."
         ),
     )
     # v0.49.0 Part A — YaRN-specific tunables (only meaningful when
@@ -2936,16 +2975,49 @@ class TrainingConfig(BaseModel):
         le=1024,
         description="YaRN beta_slow cutoff (HF default 1).",
     )
-    # v0.49.0 Part C — LongLoRA S² shifted-sparse attention.
-    # Schema gate only; live forward override deferred to v0.49.1.
+    # v0.49.0 Part C — LongLoRA S² shifted-sparse attention. Refused at config
+    # load until real S² attention exists (#1240); see _refuse_longlora.
     use_longlora: bool = Field(
         default=False,
         description=(
-            "Enable the LongLoRA S² shifted-sparse attention override. "
-            "Requires task=sft, backend=transformers, a supported decoder "
-            "architecture, and use_ring_attention=false."
+            "Refused at config load (#1240): the LongLoRA override rolled the "
+            "Q/K projections of half the heads with wrap-around under full "
+            "causal attention, leaking future tokens, and applied no S² "
+            "grouped attention. Use rope_scaling_type with plain LoRA to "
+            "extend the context."
         ),
     )
+
+    @field_validator("use_longlora")
+    @classmethod
+    def _refuse_longlora(cls, value: bool) -> bool:
+        """#1240 — refuse ``use_longlora: true`` until real S² attention exists.
+
+        The override it installed (``utils/longlora.py``) rolls the q/k
+        projection outputs of half the heads along the sequence with
+        ``torch.roll``, which wraps the last ``group_size // 2`` positions to
+        the front, before RoPE and with ``v`` unshifted, while attention stays
+        full causal: earlier positions see keys computed from the last tokens,
+        and no grouped attention runs at all. Runs after pydantic's bool
+        coercion, so the one check refuses every spelling read as true
+        (``yes``, ``on``, ``1``, ``"t"`` ...). The override and
+        ``validate_longlora_compat`` stay in place, unreachable, for the real
+        implementation.
+        """
+        if value:
+            raise ValueError(
+                "training.use_longlora: true is refused (#1240): the current "
+                "LongLoRA implementation leaks future tokens and is not S^2 "
+                "shifted sparse attention. It rolls the query/key projections "
+                "of half the heads along the sequence with wrap-around under "
+                "full causal attention, so earlier positions see keys computed "
+                "from the last tokens of the sequence, and no grouped attention "
+                "is applied. It stays refused until real S^2 attention exists. "
+                "To extend the context, set training.rope_scaling_type (linear, "
+                "dynamic, yarn or llama3) and train plain LoRA; "
+                "remove use_longlora or set it to false."
+            )
+        return value
     gradient_checkpointing: Union[
         bool, Literal["selective", "medium", "full", "auto"]
     ] = Field(
@@ -3770,6 +3842,18 @@ class TrainingConfig(BaseModel):
             )
         return value
 
+    @field_validator("rope_scaling_type", mode="before")
+    @classmethod
+    def _refuse_longrope(cls, value: Any) -> Any:
+        """#1239 — ``longrope`` can extend no checkpoint, so it is refused in any
+        spelling ahead of the Literal check, with the reason instead of a list of
+        the other types."""
+        if isinstance(value, str):
+            squashed = "".join(value.split()).lower().replace("_", "").replace("-", "")
+            if squashed == "longrope":
+                raise ValueError(LONGROPE_REFUSAL)
+        return value
+
     @model_validator(mode="after")
     def _validate_yarn_fields_require_yarn_type(self) -> "TrainingConfig":
         """v0.49.0 Part A — yarn_* fields are no-ops unless
@@ -3794,7 +3878,7 @@ class TrainingConfig(BaseModel):
     def _validate_longlora_ring_attn_exclusive(self) -> "TrainingConfig":
         """v0.49.0 Part C — LongLoRA's S² shifted-sparse attention is a custom
         forward override that conflicts with ring/FA-v3 custom-mask attention
-        paths."""
+        paths. Unreachable while ``_refuse_longlora`` refuses the field (#1240)."""
         if self.use_longlora and self.use_ring_attention:
             raise ValueError(
                 "use_longlora is incompatible with use_ring_attention "
@@ -4963,9 +5047,8 @@ class SoupConfig(BaseModel):
         """v0.49.0 Part C — LongLoRA S² shifted-sparse attention requires
         ``task=sft``, ``backend=transformers``, and a Llama-family base.
 
-        Live forward override is deferred to v0.49.1 (mirrors v0.27.0 MII /
-        v0.37.0 multipack stub-then-live pattern); the schema gate prevents
-        misconfiguration today.
+        Unreachable while ``TrainingConfig._refuse_longlora`` refuses
+        ``use_longlora: true`` (#1240); kept for the real S² implementation.
         """
         if not self.training.use_longlora:
             return self
@@ -5374,14 +5457,21 @@ class SoupConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_ebft_compat(self) -> "SoupConfig":
-        """v0.52.0 Part E — ``ebft_variant`` requires SFT, non-MLX."""
+        """v0.52.0 Part E — ``ebft_variant`` requires SFT, non-MLX.
+
+        While ``TrainingConfig._refuse_ebft_variant`` refuses every non-null
+        ``ebft_variant`` (#1230), only the temperature-alone branch is
+        reachable; the task/backend gate is kept for the real objective.
+        """
         tcfg = self.training
         if tcfg.ebft_variant is None and tcfg.ebft_temperature is None:
             return self
         if tcfg.ebft_variant is None and tcfg.ebft_temperature is not None:
             raise ValueError(
-                "training.ebft_temperature requires training.ebft_variant "
-                "to be set"
+                "training.ebft_temperature only applies to "
+                "training.ebft_variant, which is refused at config load "
+                "(#1230): EBFT is not yet a distinct objective. Remove "
+                "ebft_temperature."
             )
         from soup_cli.utils.ebft_gdpo import validate_ebft_compat
 
@@ -5813,6 +5903,20 @@ class SoupConfig(BaseModel):
                 f"is mutually exclusive with LoRA features: "
                 f"{', '.join(lora_conflicts)}. Set lora.r >= 1 to use them."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_embedding_contrastive_batch_size(self) -> "SoupConfig":
+        """#1234 - contrastive in-batch negatives need batch_size >= 2."""
+        if self.task == "embedding" and not self.training.stream_layers:
+            tcfg = self.training
+            loss = getattr(tcfg, "embedding_loss", "contrastive")
+            bs = getattr(tcfg, "batch_size", "auto")
+            if loss == "contrastive" and bs == 1:
+                raise ValueError(
+                    "contrastive in-batch negatives need batch_size >= 2; "
+                    "use triplet (with negatives) or cosine for batch 1"
+                )
         return self
 
     @model_validator(mode="after")
