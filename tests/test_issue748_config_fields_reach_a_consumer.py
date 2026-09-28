@@ -53,13 +53,44 @@ mode returns one level up, with a field "read" by code that never runs.
 Validators are excluded on principle -- a validator checks a value, a property
 resolves one for a consumer.
 
+*A read inside a function nothing references is not consumption* (#807), and
+the gate that enforces it has limits in both directions. A field is dropped
+only when EVERY read sits in such a function; one live read anywhere rescues
+it, which is what keeps the impact small -- on this tree it drops exactly one
+declared field, `warmup_auto`, pinned by
+`test_the_real_tree_has_exactly_one_known_escape`.
+
+"Referenced" is a syntactic question, not a reachability one, and it errs
+toward *referenced* -- so distrust a pass more than a failure. Two leaks
+follow. A function called only from ANOTHER dead function counts as
+referenced, because the dead caller's body loads its name: deadness is not
+transitive here. And the match is global by spelling, so an unrelated
+`obj.name` anywhere under ``src/`` rescues a dead function of the same name.
+
+The opposite hole is the one to watch: a function whose name is never loaded
+is not referenced at all, so its reads are dropped and a live field could be
+reported unconsumed. Typer command bodies are its largest decorated class
+among the modules the gate scans; undecorated functions are a larger share.
+`@app.command()` loads `app` and `command`, never the decorated function's own
+name, so on this tree 115 of the 150 `*.command`-decorated functions are absent
+from `referenced_names`, and the other 35 are present only through the global
+spelling match above. A function reached only through a string --
+`getattr(module, "name")`, or an entry point declared outside ``src/`` -- is the
+same case. On this tree that drops nothing beyond the four above.
+
 **Two rules this file learned the hard way, kept because they generalise.**
 A check can only be pinned by testing its REFUSALS: loosening a predicate
 makes a suite pass rather than fail, so `_reason_is_accountable` is asserted
-against what it rejects. And some assertions are unkillable by construction --
-the scan/import tree check in `_declared()` exists to fire in a misconfigured
-environment, so no mutation run inside a correct one can kill it. It is not
-untested, it is untestable from here; do not delete it for lack of a red.
+against what it rejects. And an assertion that looks untestable usually is not
+-- it is only unextracted. The scan/import tree check in `_declared()` was
+described here as "unkillable by construction", on the grounds that it exists
+to fire in a misconfigured environment and no mutation run inside a correct
+one can reach it. That was true of the assertion as written and false of the
+question it asks: pulling the comparison out as `describe_tree_mismatch` made
+it an ordinary function over two paths, testable in both directions with
+`tmp_path` and killed by three mutations. The lesson is the more useful one:
+"untestable from here" is a claim about the current shape of the code, not
+about the property.
 
 *It cannot see a value that is read and then rewritten.* #423 is the shape:
 ``detect_device()`` did not recognise MLX, so `quantization: 4bit` was read
@@ -79,6 +110,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import os
 import pathlib
 import re
 
@@ -275,8 +307,14 @@ def _consumed_in_src() -> set:
     property itself is called from somewhere in `src/`. See
     `schema_property_reads`.
     """
-    consumed = set(_consumed_cached(tuple(sorted(str(p) for p in _consumer_modules()))))
-    return fold_property_reads(consumed, schema_property_reads(SCHEMA_PATH))
+    modules = _consumer_modules()
+    consumed = set(_consumed_cached(tuple(sorted(str(p) for p in modules))))
+    consumed = fold_property_reads(consumed, schema_property_reads(SCHEMA_PATH))
+    # #807: a read inside a function nothing calls is not consumption, for
+    # the same reason an uncalled @property launders nothing.
+    return drop_dead_function_reads(
+        consumed, function_scoped_reads(modules), referenced_names(modules)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -288,26 +326,35 @@ def _consumed_in_src() -> set:
 # --------------------------------------------------------------------------
 KNOWN_UNCONSUMED = {
     # -- documented with a worked example, applied nowhere. Verified by hand.
-    "training.lr_groups": "no issue yet -- utils/lr_groups.py exports parse_lr_groups() and "
-                          "nothing outside schema.py imports it; documented at "
-                          "docs/peft-and-efficiency.md:190",
-    "data.mask_history": "no issue yet -- schema promises 'mask all but the last assistant turn "
-                         "during loss computation'; documented at docs/data.md:692",
-    "training.early_stop_patience": "#761 -- schema promises 'consecutive regressions "
-                                    "before early stopping'; documented at "
-                                    "docs/peft-and-efficiency.md:622",
-    "training.citation_recall_threshold": "no issue yet -- validated by utils/citation_faithful.py "
-                                          "and named in its error strings; never applied",
-    # -- found by the read/write fix, and the reason that fix exists. Both
-    #    are user settings that are OVERRIDDEN rather than merely unread, so
-    #    they are the strongest members of this list.
-    "data.remove_unused_columns": "#759 -- schema default True, documented 'set False "
-                                  "when feeding extra cols to a custom collator' "
-                                  "-- and sft.py:788 / pretrain.py:174 / "
-                                  "embedding.py:175 / grpo.py:468 each hardcode "
-                                  "False, so the setting never reaches HF",
-    "training.grace_codebook": "no issue yet -- the string appears as an artifact-kind name in "
-                               "store.py:52 / edit.py:312, unrelated to this field",
+    "training.lr_groups": "#761 -- warns at load from v0.76, refused as of v0.77; "
+                          "utils/lr_groups.py exports parse_lr_groups() and nothing "
+                          "outside schema.py imports it",
+    # data.mask_history was here until #761 wired it into data/loss_mask.py.
+    "training.early_stop_patience": "#761 -- warns at load from v0.76, refused as of "
+                                    "v0.77; no early-stop callback reads it",
+    "training.citation_recall_threshold": "#761 -- warns at load from v0.76, refused as "
+                                          "of v0.77; validated by utils/citation_faithful.py, "
+                                          "never applied",
+    # -- found by the read/write fix, and the reason that fix exists. A user
+    #    setting that is OVERRIDDEN rather than merely unread, so the strongest
+    #    kind of member this list has.
+    "training.grace_codebook": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                               "(the string appears as an artifact-kind name in "
+                               "store.py:52 / edit.py:312, unrelated to this field)",
+    # -- #807: read ONLY inside a function nothing in src/ references, so the
+    #    read is not consumption. Surfaced by the dead-function gate, which
+    #    the guard previously applied to @property resolvers only.
+    "training.warmup_auto": "#807 -- read only in autopilot.generate_config, "
+                            "which nothing in src/ calls; and that line reads "
+                            "the decisions dict and WRITES the value into a "
+                            "config, so it is not a read of the field either",
+    # -- declared, and an explicit value is IGNORED with a warning naming the
+    #    release that refuses it, so having no consumer is correct. Not refused
+    #    yet, because Soup's own writers put the old default into saved configs.
+    "data.remove_unused_columns": "#759 -- no trainer reads it; the trainers that set the "
+                                  "HF argument pass False so a custom collator still sees "
+                                  "the extra columns. The default is now False, and an "
+                                  "explicit true loads with a warning and is ignored",
     # -- declared and deliberately REFUSED, so having no consumer is correct.
     #    A distinct category from the two below: the user is told, loudly, at
     #    config load. Found by this guard rather than by hand.
@@ -318,15 +365,19 @@ KNOWN_UNCONSUMED = {
                                             "quantization.md:153",
     # -- staged for features that have not landed; grouped so they can be
     #    retired together rather than one at a time.
-    "training.long_context_grpo": "no issue yet -- documented as wiring "
-                                  "Tiled MLP; no Tiled MLP exists",
-    "training.vision_grpo": "no issue yet -- no vision GRPO path",
+    "training.long_context_grpo": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                  "(documented as wiring Tiled MLP; no Tiled MLP exists)",
+    "training.vision_grpo": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                            "(no vision GRPO path)",
     "training.load_in_16bit": "no issue needed: schema rewrites quantization at validation time",
-    "training.unsloth_bnb_4bit": "no issue yet -- unsloth quantisation staging",
-    "training.llm_int8": "no issue yet -- bitsandbytes int8 staging",
-    "training.quantize_ref_model": "no issue yet -- reference-model quantisation staging",
-    "training.convergence_window": "no issue yet -- convergence-detector staging",
-    "training.convergence_rel_tol": "no issue yet -- convergence-detector staging",
+    "training.unsloth_bnb_4bit": "no issue needed: schema assertion alias",
+    "training.llm_int8": "no issue needed: schema assertion alias",
+    "training.quantize_ref_model": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                   "(reference-model quantisation staging)",
+    "training.convergence_window": "#808 group B -- soup train reports it as not enforced "
+                                   "(convergence-detector staging)",
+    "training.convergence_rel_tol": "#808 group B -- soup train reports it as not enforced "
+                                    "(convergence-detector staging)",
     "training.forgetting_eval_steps": "#799 -- catastrophic-forgetting probe staging",
     "training.forgetting_threshold": "#799 -- staged catastrophic-forgetting threshold; "
                                      "the same name in ship.py is unrelated",
@@ -336,39 +387,93 @@ KNOWN_UNCONSUMED = {
     "training.checkpoint_eval_metric": "#799 -- checkpoint-eval staging",
     "training.checkpoint_eval_tasks": "#799 -- checkpoint-eval staging",
     "training.checkpoint_keep_top": "#799 -- checkpoint-eval staging",
-    "training.grace_codebook_size": "no issue yet -- GRACE codebook staging",
-    "training.grace_codebook_dim": "no issue yet -- GRACE codebook staging",
-    "data.video_dir": "no issue yet -- video pipeline staging",
-    "data.eval_on_each_dataset": "no issue yet -- per-dataset eval staging",
-    "data.split_thinking": "no issue yet -- thinking-block masking staging",
-    "data.image_min_pixels": "no issue yet -- image preprocessing staging",
-    "data.image_max_pixels": "no issue yet -- image preprocessing staging",
-    "data.image_resize_algorithm": "no issue yet -- image preprocessing staging",
-    "data.video_fps": "no issue yet -- video pipeline staging",
-    "data.video_maxlen": "no issue yet -- video pipeline staging",
-    "data.resize_vocab": "no issue yet -- vocab-resize staging",
-    "data.extend_conversation": "no issue yet -- conversation-extension staging",
-    "data.skip_prepare_dataset": "no issue yet -- dataset-prep bypass staging",
+    "training.grace_codebook_size": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                    "(GRACE codebook staging)",
+    "training.grace_codebook_dim": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                   "(GRACE codebook staging)",
+    "data.video_dir": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                      "(video pipeline staging)",
+    "data.eval_on_each_dataset": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                 "(per-dataset eval staging)",
+    "data.split_thinking": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                           "(thinking-block masking staging)",
+    "data.image_min_pixels": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                             "(image preprocessing staging)",
+    "data.image_max_pixels": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                             "(image preprocessing staging)",
+    "data.image_resize_algorithm": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                   "(image preprocessing staging)",
+    "data.video_fps": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                      "(video pipeline staging)",
+    "data.video_maxlen": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                         "(video pipeline staging)",
+    "data.resize_vocab": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                         "(vocab-resize staging)",
+    "data.extend_conversation": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                "(conversation-extension staging)",
+    "data.skip_prepare_dataset": "#808 -- warns at load from v0.76, refused as of v0.77 "
+                                 "(dataset-prep bypass staging)",
 }
+
+
+def describe_tree_mismatch(imported: pathlib.Path, scanned: pathlib.Path):
+    """Return a message if these are different trees, else None.
+
+    Compared by **identity, not spelling**. The original form was
+    ``imported == scanned``, which is wrong on a case-insensitive filesystem:
+    macOS preserves case but does not distinguish it, and ``Path.resolve()``
+    returns the path as typed. Handing pytest this file as
+    ``/users/.../soup/tests/...`` gives a lowercase ``scanned`` (it is derived
+    from ``__file__``) while the editable install resolves to the canonical
+    ``/Users/.../Soup``, so two spellings of one directory compared
+    unequal and the guard reported a broken rebase that had not happened.
+    A good error message for a condition that is not an error is still a false
+    alarm.
+
+    ``os.path.samefile`` compares device and inode, so it answers the question
+    the assertion is actually asking. It RAISES on a missing path rather than
+    returning False, which is why existence is checked first -- that is the
+    one case the assertion most needs to report rather than crash on.
+
+    No test-count evidence is quoted here on purpose. The previous comment
+    cited "17 passed without PYTHONPATH, 2 failed with it", measured against a
+    17-test file and the ``==`` version, so the number was stale on its own
+    terms before the comparison changed. `TestTheTreeMismatchCheck` pins the
+    behaviour instead, which cannot go stale the way a remembered count does.
+    """
+    if not imported.exists():
+        return f"the imported soup_cli does not exist on disk: {imported}"
+    if not scanned.exists():
+        return f"the tree being scanned does not exist: {scanned}"
+    if os.path.samefile(imported, scanned):
+        return None
+    return (
+        f"scanning {scanned} but importing {imported}; set "
+        "PYTHONPATH=<checkout>/src or reinstall with `pip install -e .`, "
+        "or this guard silently passes against the wrong source"
+    )
 
 
 def _declared():
     import soup_cli
-    from soup_cli.config.schema import DataConfig, TrainingConfig
+    from soup_cli.config.schema import DataConfig, LoraConfig, TrainingConfig
 
     # The scan walks SRC (this checkout); the fields come from the IMPORTED
     # package. In a worktree with no PYTHONPATH those are different trees and
     # the mismatch fails GREEN -- the silent-pass failure mode this file
-    # exists to prevent. Measured: 17 passed without PYTHONPATH, 2 failed with
-    # it, on the same tree.
+    # exists to prevent.
     imported = pathlib.Path(soup_cli.__file__).resolve().parent
-    assert imported == SRC, (
-        f"scanning {SRC} but importing {imported}; set PYTHONPATH=<checkout>/src "
-        "or reinstall with `pip install -e .`, or this guard silently passes"
-    )
+    problem = describe_tree_mismatch(imported, SRC)
+    assert problem is None, problem
 
     out = {}
-    for cls, label in ((TrainingConfig, "training"), (DataConfig, "data")):
+    # #807: LoraConfig was outside the guard's scope entirely, so every
+    # LoRA-variant field was unguarded.
+    for cls, label in (
+        (TrainingConfig, "training"),
+        (DataConfig, "data"),
+        (LoraConfig, "training.lora"),
+    ):
         for name in cls.model_fields:
             out[f"{label}.{name}"] = name
     return out
@@ -761,3 +866,256 @@ def test_the_known_leak_is_still_the_known_leak():
             "guard can now catch an unwired field of that name. Good news — "
             "update the leak table in the module docstring."
         )
+
+
+# --------------------------------------------------------------------------
+# #807: the same laundering the property gate refuses, one level over.
+#
+# `fold_property_reads` gates a `schema.py` @property on being CALLED. Ordinary
+# functions got no such gate, so a read inside a function nothing calls counted
+# exactly like a read in a trainer. `training.warmup_auto` passed the guard on
+# the strength of one line in `autopilot/generate_config.generate_config`,
+# which nothing in src/ calls -- and which reads the autopilot decisions dict
+# and writes the value INTO a config, so it is not even a read of the field.
+# --------------------------------------------------------------------------
+
+
+def function_scoped_reads(paths) -> dict:
+    """Map each read name to the {(module, enclosing function)} it occurs in.
+
+    ``None`` as the function means module scope, which always counts: a read at
+    import time runs whenever the module is imported.
+
+    Every function is attributed, **methods included**. An earlier version of
+    this walked only `tree.body` top-level defs, so a read inside a class
+    method was invisible -- and a field whose only live read sits in a method
+    then looked dead. That produced two false positives on the real tree
+    (`auto_mixed_precision`, read at `trainer/sft.py:1185`, and
+    `training.multipack`). False positives are what get a guard deleted, so the
+    attribution has to cover methods or the gate is worse than no gate.
+    """
+    out: dict = {}
+    for path in paths:
+        try:
+            tree = ast.parse(path.read_text(errors="ignore"))
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            continue
+        stack = [(tree, None)]
+        while stack:
+            node, fname = stack.pop()
+            for child in ast.iter_child_nodes(node):
+                inner = (
+                    child.name
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    else fname
+                )
+                name = None
+                if isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Load):
+                    name = child.attr
+                elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+                    name = child.value
+                if name:
+                    out.setdefault(name, set()).add((path.name, fname))
+                stack.append((child, inner))
+    return out
+
+
+def referenced_names(paths) -> set:
+    """Every name loaded anywhere under src/ -- the "is this function called?" set.
+
+    A global name match, deliberately. It errs toward "referenced", which is
+    the safe direction: a guard that cries wolf on live code gets deleted, and
+    a missed dead function is only a return to today's behaviour.
+    """
+    names: set = set()
+    for path in paths:
+        try:
+            tree = ast.parse(path.read_text(errors="ignore"))
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                names.add(node.attr)
+    return names
+
+
+def drop_dead_function_reads(consumed: set, scoped: dict, referenced: set) -> set:
+    """Remove names whose EVERY read sits in a function nothing references.
+
+    The function-level twin of `fold_property_reads`, and extracted for the
+    same reason: a gate can only be pinned by driving it directly. Testing it
+    through the real tree cannot distinguish the gate from its absence for any
+    field that is genuinely live. Its limits are stated in the module
+    docstring's "What this cannot see" list.
+    """
+    out = set(consumed)
+    for name, sites in scoped.items():
+        if name not in out:
+            continue
+        if all(fn is not None and fn not in referenced for _, fn in sites):
+            out.discard(name)
+    return out
+
+
+class TestTheDeadFunctionGate:
+    """#807. Both directions, driven through the gate rather than the tree."""
+
+    def test_a_read_in_a_referenced_function_still_counts(self):
+        consumed = {"widget"}
+        scoped = {"widget": {("m.py", "live_helper")}}
+        assert "widget" in drop_dead_function_reads(consumed, scoped, {"live_helper"})
+
+    def test_a_read_in_a_function_nothing_references_is_dropped(self):
+        consumed = {"widget"}
+        scoped = {"widget": {("m.py", "dead_helper")}}
+        assert "widget" not in drop_dead_function_reads(consumed, scoped, {"other"})
+
+    def test_one_live_read_rescues_a_field_with_dead_ones(self):
+        """A field read in both a live and a dead function is consumed. Anything
+        else would flag `auto_mixed_precision`, which `sft.py` really reads."""
+        consumed = {"widget"}
+        scoped = {"widget": {("dead.py", "never_called"), ("live.py", "used")}}
+        assert "widget" in drop_dead_function_reads(consumed, scoped, {"used"})
+
+    def test_a_module_scope_read_always_counts(self):
+        """Module scope runs on import; there is no enclosing function to be
+        dead."""
+        consumed = {"widget"}
+        assert "widget" in drop_dead_function_reads(
+            consumed, {"widget": {("m.py", None)}}, set()
+        )
+
+    def test_methods_are_attributed_not_skipped(self, tmp_path):
+        """The false-positive generator. Walking only top-level defs made a
+        read inside a method invisible, so the field looked dead."""
+        mod = tmp_path / "m.py"
+        mod.write_text(
+            "class C:\n"
+            "    def a_method(self, cfg):\n"
+            "        return cfg.widget\n"
+        )
+        scoped = function_scoped_reads([mod])
+        assert scoped.get("widget") == {("m.py", "a_method")}, (
+            "a read inside a method must be attributed to that method, not lost"
+        )
+
+    def test_the_real_tree_has_exactly_one_known_escape(self):
+        """Measured, and pinned so the number cannot drift unnoticed."""
+        modules = _consumer_modules()
+        scoped = function_scoped_reads(modules)
+        referenced = referenced_names(modules)
+        # The UNGATED set: _consumed_in_src() already applies the gate, so
+        # diffing it against itself would always be empty and this test would
+        # pass vacuously. Rebuild the pre-gate set the same way it does.
+        ungated = fold_property_reads(
+            set(_consumed_cached(tuple(sorted(str(m) for m in modules)))),
+            schema_property_reads(SCHEMA_PATH),
+        )
+        dropped = sorted(ungated - drop_dead_function_reads(ungated, scoped, referenced))
+        assert "warmup_auto" in dropped, (
+            "warmup_auto is read only inside a function nothing references, "
+            "so the gate should drop it"
+        )
+        # The name says EXACTLY one, and membership alone would pass a gate that
+        # dropped more (#906 review). `dropped` spans every consumed identifier,
+        # not just config fields, so the exact claim is over declared leaves.
+        declared_leaves = set(_declared().values())
+        dropped_fields = sorted(set(dropped) & declared_leaves)
+        assert dropped_fields == ["warmup_auto"], (
+            f"expected exactly the one known escape, got {dropped_fields}"
+        )
+
+    def test_consumed_in_src_applies_the_gate_independently_of_the_allowlist(self):
+        """#906 review: the only thing that caught the gate being removed from
+        `_consumed_in_src()` was `test_the_allowlist_does_not_cover_fields_that_
+        are_consumed` -- the pin scheduled for deletion once #794/#808 retire
+        those entries. This pins the composition directly: each escape is read
+        in the ungated set, and must be absent from what the scan returns."""
+        modules = _consumer_modules()
+        ungated = fold_property_reads(
+            set(_consumed_cached(tuple(sorted(str(m) for m in modules)))),
+            schema_property_reads(SCHEMA_PATH),
+        )
+        consumed = _consumed_in_src()
+        assert "warmup_auto" in ungated, (
+            "warmup_auto is not read at all, so this check is vacuous"
+        )
+        assert "warmup_auto" not in consumed, (
+            "warmup_auto is read only inside a dead function, yet _consumed_in_src() "
+            "counts it: the gate is not composed into the scan"
+        )
+
+
+class TestTheTreeMismatchCheck:
+    """The scan/import guard, compared by identity rather than by spelling.
+
+    Reported by another session on this account: given this file by a
+    lowercased path, the guard failed with a message that reads like a broken
+    rebase. A lowercased `cd` alone does not do it -- `getcwd()` returns the
+    canonical spelling -- so the spelling arrives through `__file__`. macOS is
+    case-insensitive but case-PRESERVING and `Path.resolve()` does not
+    normalise case, so `==` compared two spellings of one directory and called
+    them different.
+
+    These replace a comment that cited "17 passed without PYTHONPATH, 2 failed
+    with it" as its evidence. That count was measured against the `==` version
+    and against a 17-test file that has grown since. A number that travels
+    between implementations is exactly what a test should be doing instead.
+    """
+
+    @pytest.mark.requires_symlink
+    def test_the_same_directory_reached_by_a_different_spelling_is_not_a_mismatch(
+        self, tmp_path
+    ):
+        """The false alarm, reproduced through a symlink rather than by relying
+        on the filesystem being case-insensitive -- so this test means the same
+        thing on Linux CI, where `/Users` and `/users` really are different."""
+        real = tmp_path / "Soup" / "src" / "soup_cli"
+        real.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(tmp_path / "Soup")
+        other_spelling = alias / "src" / "soup_cli"
+
+        assert real != other_spelling, "the two spellings differ as strings"
+        assert describe_tree_mismatch(real, other_spelling) is None, (
+            "one directory reached two ways is not a mismatch; comparing "
+            "spelling rather than identity is what produced the false alarm"
+        )
+
+    def test_genuinely_different_trees_are_still_caught(self, tmp_path):
+        """The case the assertion exists for, and the one that must not be lost
+        to the fix: a worktree with no PYTHONPATH scans one tree while
+        importing another, and the guard would otherwise pass GREEN."""
+        a = tmp_path / "checkout" / "src" / "soup_cli"
+        b = tmp_path / "installed" / "soup_cli"
+        a.mkdir(parents=True)
+        b.mkdir(parents=True)
+
+        msg = describe_tree_mismatch(b, a)
+        assert msg is not None
+        assert "PYTHONPATH" in msg, "the message must say how to fix it"
+
+    def test_a_missing_imported_path_is_reported_not_crashed(self, tmp_path):
+        """`os.path.samefile` raises rather than returning False on a missing
+        path, so existence is checked first. This is the case the assertion
+        most needs to report."""
+        scanned = tmp_path / "src" / "soup_cli"
+        scanned.mkdir(parents=True)
+        msg = describe_tree_mismatch(tmp_path / "gone", scanned)
+        assert msg is not None and "does not exist" in msg
+
+    def test_a_missing_scanned_path_is_reported_not_crashed(self, tmp_path):
+        imported = tmp_path / "soup_cli"
+        imported.mkdir()
+        msg = describe_tree_mismatch(imported, tmp_path / "gone")
+        assert msg is not None and "does not exist" in msg
+
+    def test_the_real_checkout_agrees_with_itself(self):
+        """Control on the live tree: whatever this run's spelling, the guard
+        must not fire."""
+        import soup_cli
+
+        imported = pathlib.Path(soup_cli.__file__).resolve().parent
+        assert describe_tree_mismatch(imported, SRC) is None

@@ -48,7 +48,7 @@ def search_recipes(
 
 
 # ---------------------------------------------------------------------------
-# Recipe catalog (174 recipes)
+# Recipe catalog (172 recipes)
 # ---------------------------------------------------------------------------
 
 RECIPES: Dict[str, RecipeMeta] = {
@@ -450,6 +450,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -513,34 +514,6 @@ training:
     target_modules: auto
   quantization: 4bit
   dpo_beta: 0.1
-
-output: ./output
-""",
-    ),
-    "gemma3-9b-sft": RecipeMeta(
-        model="google/gemma-3-9b-it",
-        task="sft",
-        size="9B",
-        tags=("gemma", "google", "sft", "chat"),
-        description="Gemma 3 9B instruction tuning",
-        yaml_str="""\
-base: google/gemma-3-9b-it
-task: sft
-
-data:
-  train: ./data/train.jsonl
-  format: auto
-  max_length: 2048
-
-training:
-  epochs: 3
-  lr: 2e-4
-  batch_size: auto
-  lora:
-    r: 16
-    alpha: 32
-    target_modules: auto
-  quantization: 4bit
 
 output: ./output
 """,
@@ -1198,6 +1171,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -1478,6 +1452,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 32
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -1927,6 +1902,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -1957,6 +1933,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -2791,13 +2768,13 @@ output: ./output
 """,
     ),
     "glm-4.6-sft": RecipeMeta(
-        model="THUDM/glm-4.6",
+        model="zai-org/GLM-4.6",
         task="sft",
         size="9B",
-        tags=("glm", "thudm", "chat", "instruction"),
+        tags=("glm", "zai-org", "chat", "instruction"),
         description="GLM 4.6 instruction tuning with LoRA",
         yaml_str="""\
-base: THUDM/glm-4.6
+base: zai-org/GLM-4.6
 task: sft
 
 data:
@@ -2847,13 +2824,13 @@ output: ./output
 """,
     ),
     "kimi-k2-sft": RecipeMeta(
-        model="moonshotai/Kimi-K2",
+        model="moonshotai/Kimi-K2-Base",
         task="sft",
         size="N/A",
         tags=("kimi", "moonshot", "moe", "long-context"),
         description="Kimi K2 SFT (Moonshot MoE, long-context-aware)",
         yaml_str="""\
-base: moonshotai/Kimi-K2
+base: moonshotai/Kimi-K2-Base
 task: sft
 
 data:
@@ -2866,6 +2843,7 @@ training:
   lr: 1e-4
   batch_size: auto
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -3006,13 +2984,13 @@ output: ./output
     # v0.51.0 Part B — Small / edge / specialist (~6 model families)
     # ------------------------------------------------------------------
     "granite-4-sft": RecipeMeta(
-        model="ibm-granite/granite-4.0-tiny-base",
+        model="ibm-granite/granite-4.0-h-tiny-base",
         task="sft",
-        size="3B",
+        size="7B",
         tags=("granite", "ibm", "small", "instruction"),
         description="IBM Granite 4.0 tiny SFT",
         yaml_str="""\
-base: ibm-granite/granite-4.0-tiny-base
+base: ibm-granite/granite-4.0-h-tiny-base
 task: sft
 
 data:
@@ -3061,34 +3039,6 @@ training:
 output: ./output
 """,
     ),
-    "cogito-v2-sft": RecipeMeta(
-        model="deepcogito/cogito-v2-preview",
-        task="sft",
-        size="14B",
-        tags=("cogito", "deepcogito", "instruction"),
-        description="Cogito v2 preview SFT",
-        yaml_str="""\
-base: deepcogito/cogito-v2-preview
-task: sft
-
-data:
-  train: ./data/train.jsonl
-  format: auto
-  max_length: 4096
-
-training:
-  epochs: 3
-  lr: 2e-4
-  batch_size: auto
-  lora:
-    r: 16
-    alpha: 32
-    target_modules: auto
-  quantization: 4bit
-
-output: ./output
-""",
-    ),
     "mistral-small-3-sft": RecipeMeta(
         model="mistralai/Mistral-Small-24B-Instruct-2501",
         task="sft",
@@ -3118,13 +3068,13 @@ output: ./output
 """,
     ),
     "mistral-medium-3-5-sft": RecipeMeta(
-        model="mistralai/Mistral-Medium-3.5",
+        model="mistralai/Mistral-Medium-3.5-128B",
         task="sft",
-        size="N/A",
+        size="128B",
         tags=("mistral", "medium", "instruction", "large"),
         description="Mistral Medium 3.5 SFT",
         yaml_str="""\
-base: mistralai/Mistral-Medium-3.5
+base: mistralai/Mistral-Medium-3.5-128B
 task: sft
 
 data:
@@ -3175,13 +3125,13 @@ output: ./output
 """,
     ),
     "devstral-sft": RecipeMeta(
-        model="mistralai/Devstral-Small",
+        model="mistralai/Devstral-Small-2507",
         task="sft",
         size="24B",
         tags=("mistral", "devstral", "code", "agent"),
         description="Devstral Small code/agent SFT",
         yaml_str="""\
-base: mistralai/Devstral-Small
+base: mistralai/Devstral-Small-2507
 task: sft
 
 data:
@@ -3322,13 +3272,13 @@ output: ./output
 """,
     ),
     "internvl-3-5-sft": RecipeMeta(
-        model="OpenGVLab/InternVL3-5",
+        model="OpenGVLab/InternVL3_5-8B",
         task="sft",
         size="8B",
         tags=("internvl", "vision", "multimodal", "opengvlab"),
         description="InternVL 3.5 vision SFT",
         yaml_str="""\
-base: OpenGVLab/InternVL3-5
+base: OpenGVLab/InternVL3_5-8B
 task: sft
 modality: vision
 
@@ -3353,13 +3303,13 @@ output: ./output
 """,
     ),
     "voxtral-sft": RecipeMeta(
-        model="mistralai/Voxtral-Mini-3B",
+        model="mistralai/Voxtral-Mini-3B-2507",
         task="sft",
         size="3B",
         tags=("mistral", "voxtral", "audio", "multimodal"),
         description="Voxtral Mini 3B audio SFT",
         yaml_str="""\
-base: mistralai/Voxtral-Mini-3B
+base: mistralai/Voxtral-Mini-3B-2507
 task: sft
 modality: audio
 
@@ -3537,38 +3487,12 @@ training:
 output: ./output
 """,
     ),
-    "sesame-csm-tts": RecipeMeta(
-        model="sesame/csm-1b",
-        task="tts",
-        size="1B",
-        tags=("tts", "sesame", "audio_out", "v0.52.0"),
-        description="Sesame CSM conversational TTS — live (v0.71.20)",
-        yaml_str="""\
-base: sesame/csm-1b
-task: tts
-modality: audio_out
-
-data:
-  train: ./data/tts_train.jsonl
-  format: audio
-  audio_dir: ./data/audio
-  max_length: 2048
-
-training:
-  epochs: 3
-  lr: 5e-5
-  batch_size: auto
-  tts_family: sesame_csm
-
-output: ./output
-""",
-    ),
     "llasa-tts": RecipeMeta(
         model="HKUSTAudio/Llasa-1B",
         task="tts",
         size="1B",
         tags=("tts", "llasa", "audio_out", "v0.52.0"),
-        description="Llasa-TTS — live (v0.71.20)",
+        description="Llasa-TTS — live XCodec2 encode-at-train-time path",
         yaml_str="""\
 base: HKUSTAudio/Llasa-1B
 task: tts
@@ -3732,34 +3656,6 @@ training:
     alpha: 32
     target_modules: auto
   quantization: 4bit
-
-output: ./output
-""",
-    ),
-    "falcon-e-bitnet-sft": RecipeMeta(
-        model="tiiuae/Falcon-E-1B-Instruct",
-        task="sft",
-        size="1B",
-        tags=("bitnet", "1.58bit", "falcon-e", "ternary", "v0.52.0"),
-        description="Falcon-E BitNet 1.58-bit SFT — live (v0.71.20)",
-        yaml_str="""\
-base: tiiuae/Falcon-E-1B-Instruct
-task: sft
-
-data:
-  train: ./data/train.jsonl
-  format: auto
-  max_length: 2048
-
-training:
-  epochs: 3
-  lr: 1e-4
-  batch_size: auto
-  quantization: bitnet_1.58
-  lora:
-    r: 16
-    alpha: 32
-    target_modules: auto
 
 output: ./output
 """,
@@ -4096,6 +3992,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4128,6 +4025,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4168,6 +4066,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4207,6 +4106,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4243,6 +4143,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 32
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4284,6 +4185,70 @@ training:
 output: ./output
 """,
     ),
+    "qwen3.6-27b-dpo": RecipeMeta(
+        model="Qwen/Qwen3.6-27B",
+        task="dpo",
+        size="27B",
+        tags=("qwen", "qwen3.6", "dpo", "alignment", "preference", "large", "deepspeed"),
+        description="Qwen 3.6 27B DPO alignment (Apache-2.0) with DeepSpeed ZeRO-2",
+        yaml_str="""\
+base: Qwen/Qwen3.6-27B
+task: dpo
+modality: text
+
+data:
+  train: ./data/preference_train.jsonl
+  format: dpo
+  max_length: 4096
+
+training:
+  epochs: 3
+  lr: 5e-6
+  batch_size: auto
+  gradient_accumulation_steps: 8
+  lora:
+    r: 16
+    alpha: 32
+    target_modules: auto
+  quantization: 4bit
+  dpo_beta: 0.1
+
+output: ./output
+""",
+    ),
+    "qwen3.6-27b-grpo": RecipeMeta(
+        model="Qwen/Qwen3.6-27B",
+        task="grpo",
+        size="27B",
+        tags=("qwen", "qwen3.6", "grpo", "reasoning", "thinking", "large", "deepspeed"),
+        description="Qwen 3.6 27B GRPO reasoning training (Apache-2.0) with DeepSpeed ZeRO-2",
+        yaml_str="""\
+base: Qwen/Qwen3.6-27B
+task: grpo
+modality: text
+
+data:
+  train: ./data/reasoning_train.jsonl
+  format: auto
+  max_length: 4096
+
+training:
+  epochs: 3
+  lr: 1e-5
+  batch_size: auto
+  gradient_accumulation_steps: 8
+  lora:
+    r: 16
+    alpha: 32
+    target_modules: auto
+  quantization: 4bit
+  grpo_beta: 0.1
+  num_generations: 4
+  reward_fn: accuracy
+
+output: ./output
+""",
+    ),
     "qwen3.6-35b-a3b-sft": RecipeMeta(
         model="Qwen/Qwen3.6-35B-A3B",
         task="sft",
@@ -4306,6 +4271,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4338,6 +4304,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4371,6 +4338,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4436,6 +4404,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4467,6 +4436,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4509,6 +4479,7 @@ training:
   batch_size: auto
   gradient_accumulation_steps: 8
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4544,6 +4515,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 32
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4578,6 +4550,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4612,6 +4585,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4648,6 +4622,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4686,6 +4661,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4721,6 +4697,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4757,6 +4734,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4794,6 +4772,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 32
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4829,6 +4808,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 16
     alpha: 32
     target_modules: auto
@@ -4866,6 +4846,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4902,6 +4883,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4937,6 +4919,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 16
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -4973,6 +4956,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 32
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto
@@ -5017,6 +5001,7 @@ training:
   batch_size: 1
   gradient_accumulation_steps: 32
   lora:
+    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)
     r: 32
     alpha: 64
     target_modules: auto

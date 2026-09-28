@@ -20,18 +20,11 @@ import os
 
 import pytest
 
+from tests.conftest import cuda_available
 
 # ==========================================================================
 # fixtures (mirroring tests/test_v07200.py so the two cannot drift)
 # ==========================================================================
-def _cuda_available():
-    try:
-        import torch
-
-        return torch.cuda.is_available()
-    except Exception:  # pragma: no cover - torch always present in CI
-        return False
-
 
 def _torch_version():
     """Reported in the KTO xfail message: the failure it tolerates is a torch
@@ -52,7 +45,7 @@ def _mps_is_the_accelerator():
         return (
             hasattr(torch.backends, "mps")
             and torch.backends.mps.is_available()
-            and not torch.cuda.is_available()
+            and not cuda_available()
         )
     except Exception:  # pragma: no cover
         return False
@@ -361,6 +354,7 @@ def _build_streamed_wrapper(
     device=None,
     hidden=64,
     vocab=64,
+    tie=True,
     **training,
 ):
     """Build a task wrapper through the REAL `setup()` path, streaming.
@@ -372,14 +366,16 @@ def _build_streamed_wrapper(
     bf16 on CUDA, and "bit-exact" is only a meaningful assertion in the former
     (a bf16 logp of -12.75 cannot represent a change smaller than ~0.05).
     """
-    weights, resident, _ = _tiny_llama_dir(tmp_path, n_layers=n_layers, hidden=hidden, vocab=vocab)
+    weights, resident, _ = _tiny_llama_dir(
+        tmp_path, n_layers=n_layers, tie=tie, hidden=hidden, vocab=vocab
+    )
     _write_tiny_tokenizer(weights)
     monkeypatch.setenv("SOUP_LAYER_STREAM_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.chdir(tmp_path)
     training.setdefault("batch_size", _MIN_BATCH.get(task, 1))
     cfg = _stream_cfg(weights, tmp_path / "out", task=task, **training)
     if device is None:
-        device = "cuda" if _cuda_available() else "cpu"
+        device = "cuda" if cuda_available() else "cpu"
     wrapper = _wrapper_for(task)(cfg, device=device)
     wrapper.setup({"train": _TASK_ROWS[task](8)})
     return wrapper, resident, weights
@@ -538,7 +534,7 @@ class TestNoSecondModelInstance:
         assert diff == 0.0, diff
 
 
-@pytest.mark.skipif(not _cuda_available(), reason="peak VRAM needs CUDA")
+@pytest.mark.gpu(reason="peak VRAM needs CUDA")
 class TestPeakVramIsNotDoubled:
     """The brief's literal assertion, on the real device."""
 
@@ -603,7 +599,7 @@ class TestPeakVramIsNotDoubled:
         assert forced > implicit, (implicit, forced)
 
 
-@pytest.mark.skipif(not _cuda_available(), reason="the #328 meta failure is CUDA-only")
+@pytest.mark.gpu(reason="the #328 meta failure is CUDA-only")
 class TestEveryPreferenceLossTakesAStreamedStep:
     """#370 — a real ``setup()`` + ``train()`` step for ALL FOUR preference
     losses on the device the failure actually needs.
@@ -1031,7 +1027,7 @@ class TestKtoNeedsMoreThanOneRow:
         try:
             wrapper.trainer.train()
         except RuntimeError as exc:
-            if not _cuda_available() and "expected device meta" in str(exc):
+            if not cuda_available() and "expected device meta" in str(exc):
                 pytest.xfail(
                     "#328: known meta leak in KTO's KL forward on CPU under "
                     f"newer torch (this run: {_torch_version()})"

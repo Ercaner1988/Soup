@@ -1,12 +1,15 @@
 """Load and validate soup.yaml configs."""
 
+import warnings
 from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
 from rich.console import Console
 
+from soup_cli.config.deprecation import SoupConfigDeprecationWarning
 from soup_cli.config.schema import SoupConfig
+from soup_cli.config.staged_fields import find_staged_config_fields, format_staged_fields
 from soup_cli.config.unknown_keys import find_unknown_config_keys, format_unknown_keys
 from soup_cli.utils.terminal import for_terminal
 
@@ -31,6 +34,15 @@ console = Console()
 #: ``__version__`` in both directions, so it can be neither forgotten nor
 #: flipped early.
 UNKNOWN_KEY_SEVERITY = "error"
+
+#: What to do about a declared config field that is read by nothing (#808).
+#:
+#: The decision was warn-then-forbid. Ships ``"warn"`` with a deadline named
+#: by :data:`~soup_cli.config.staged_fields.STAGED_FIELD_REJECTION_VERSION` -- by
+#: reference, not by number, because the warning stated that version in
+#: exactly one place -- and the release that reaches it flips this to
+#: ``"error"``.
+STAGED_FIELD_SEVERITY = "warn"
 
 
 def _report_unknown_keys(raw: dict) -> "str | None":
@@ -57,6 +69,55 @@ def _report_unknown_keys(raw: dict) -> "str | None":
         "if you had not written it.[/]"
     )
     return None
+
+
+def _report_staged_fields(
+    raw: dict, *, config: SoupConfig
+) -> "str | None":
+    """Return an error string when staged fields must stop the load (#808).
+
+    Silence is the thing being fixed: under ``"warn"`` it is printed and
+    ``None`` is returned; under ``"error"`` the message is handed back for the
+    caller to raise in its own contract (``SystemExit`` for the CLI,
+    ``ValueError`` for the API/UI).
+    """
+    staged = find_staged_config_fields(raw, config=config)
+    if not staged:
+        return None
+    warning = STAGED_FIELD_SEVERITY != "error"
+    message = format_staged_fields(staged, include_deadline=warning)
+    if not warning:
+        return message
+    console.print(f"[yellow]Warning:[/] {for_terminal(message)}")
+    return None
+
+
+def _build_config(raw: dict) -> SoupConfig:
+    """Construct ``SoupConfig``, printing each deprecated value once (#759).
+
+    Validators report a value that will be refused in a later release as a
+    :class:`SoupConfigDeprecationWarning`. Recorded here rather than left to the
+    ``warnings`` filters, which print a source line, may show a message once
+    per process rather than once per load, or hide it entirely. Any other
+    warning raised while building is passed on unchanged.
+    """
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            config = SoupConfig(**raw)
+    finally:
+        # Outside the ``catch_warnings`` block: re-raising a warning inside it
+        # would record it again into the list being walked.
+        printed: set = set()
+        for item in caught:
+            if issubclass(item.category, SoupConfigDeprecationWarning):
+                message = str(item.message)
+                if message not in printed:
+                    printed.add(message)
+                    console.print(f"[yellow]Warning:[/] {for_terminal(message)}")
+            else:
+                warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
+    return config
 
 
 def load_config(
@@ -97,12 +158,18 @@ def load_config(
         raise SystemExit(1)
 
     try:
-        config = SoupConfig(**raw)
+        config = _build_config(raw)
     except ValidationError as e:
         console.print("[red bold]Config validation error:[/]\n")
         for err in e.errors():
             loc = " -> ".join(str(part) for part in err["loc"])
             console.print(f"  [red]{loc}:[/] {err['msg']}")
+        raise SystemExit(1)
+
+    staged_error = _report_staged_fields(raw, config=config)
+    if staged_error is not None:
+        console.print("[red bold]Config validation error:[/]\n")
+        console.print(f"  [red]{for_terminal(staged_error)}[/]")
         raise SystemExit(1)
 
     return config
@@ -130,10 +197,16 @@ def load_config_from_string(yaml_str: str) -> SoupConfig:
         raise ValueError(unknown_error)
 
     try:
-        return SoupConfig(**raw)
+        config = _build_config(raw)
     except ValidationError as exc:
         errors = []
         for err in exc.errors():
             loc = " -> ".join(str(part) for part in err["loc"])
             errors.append(f"{loc}: {err['msg']}")
         raise ValueError("; ".join(errors))
+
+    staged_error = _report_staged_fields(raw, config=config)
+    if staged_error is not None:
+        raise ValueError(staged_error)
+
+    return config

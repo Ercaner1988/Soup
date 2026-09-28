@@ -12,11 +12,12 @@ in a single module guarantees a single behaviour across the CLI.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import tempfile
 from pathlib import Path
-from typing import Iterable, Union
+from typing import Iterable, Optional, Union
 
 
 def is_under(path: Union[str, Path], base: Union[str, Path]) -> bool:
@@ -309,3 +310,147 @@ def atomic_write_bytes_group(
             pass
 
     return [os.path.realpath(output_path) for _data, output_path, _field in prepared]
+
+
+def refuse_linked_dirs(
+    path: Union[str, Path],
+    *,
+    stop_at: Union[str, Path, None] = None,
+) -> None:
+    """Inspect directory hierarchy from ``path`` up to ``stop_at`` for symlinks and
+    junctions (#1158).
+
+    Raises :exc:`OSError` with :data:`errno.ELOOP` if any directory component
+    between ``path`` and ``stop_at`` is a symbolic link or junction / reparse point.
+    """
+    if not isinstance(path, (str, Path)):
+        raise TypeError(f"path must be str or Path, got {type(path).__name__}")
+    p = str(path)
+    if not p:
+        raise ValueError("path must be non-empty")
+    if "\x00" in p:
+        raise ValueError("path must not contain null bytes")
+
+    curr = os.path.abspath(p)
+    stop: Optional[str] = None
+    if stop_at is not None:
+        stop = os.path.abspath(str(stop_at))
+    elif is_under_cwd(curr):
+        stop = os.path.abspath(os.getcwd())
+
+    stop_norm = os.path.normcase(stop) if stop is not None else None
+
+    while curr and curr != os.path.dirname(curr):
+        curr_norm = os.path.normcase(curr)
+        if stop_norm is not None and curr_norm == stop_norm:
+            break
+        if os.path.lexists(curr):
+            st = os.lstat(curr)
+            if stat.S_ISLNK(st.st_mode):
+                raise OSError(
+                    errno.ELOOP, f"Directory symbolic link not allowed: {curr!r}"
+                )
+            if os.name == "nt":
+                reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                if getattr(st, "st_file_attributes", 0) & reparse:
+                    raise OSError(
+                        errno.ELOOP, f"Directory reparse point not allowed: {curr!r}"
+                    )
+        if stop is not None:
+            try:
+                if os.path.samefile(curr, stop):
+                    break
+            except OSError:
+                pass
+        curr = os.path.dirname(curr)
+
+
+def open_no_follow(
+    path: Union[str, Path],
+    flags: int,
+    mode: int = 0o600,
+    *,
+    check_parent: bool = False,
+    refuse_hardlink: bool = False,
+) -> int:
+    """Open ``path`` refusing to follow symlinks across all platforms (#820).
+
+    On POSIX, applies ``O_NOFOLLOW`` at open time. On Windows (where
+    ``os.O_NOFOLLOW`` is absent from the OS open flags), performs pre-open
+    ``os.lstat`` inspection for ``S_ISLNK`` and reparse points, and post-open
+    ``os.fstat`` cross-validation against the opened file descriptor to detect
+    a TOCTOU swap.
+
+    When ``check_parent`` is True (#1158), inspects parent directory components
+    for symlinks and reparse points. When ``refuse_hardlink`` is True (#1158),
+    rejects hardlinked regular files (``st_nlink > 1``) with :data:`errno.EMLINK`.
+
+    Raises :exc:`OSError` with :data:`errno.ELOOP` if ``path`` is a symlink or
+    reparse point, or :data:`errno.EMLINK` if hardlinked.
+    """
+    if not isinstance(path, (str, Path)):
+        raise TypeError(f"path must be str or Path, got {type(path).__name__}")
+    p = str(path)
+    if not p:
+        raise ValueError("path must be non-empty")
+    if "\x00" in p:
+        raise ValueError("path must not contain null bytes")
+
+    pre_st: Optional[os.stat_result] = None
+    try:
+        pre_st = os.lstat(p)
+    except FileNotFoundError:
+        pre_st = None
+
+    if pre_st is not None:
+        if stat.S_ISLNK(pre_st.st_mode):
+            raise OSError(errno.ELOOP, f"Symbolic link not allowed: {p!r}")
+        if os.name == "nt":
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            if getattr(pre_st, "st_file_attributes", 0) & reparse:
+                raise OSError(errno.ELOOP, f"Reparse point not allowed: {p!r}")
+
+    if check_parent:
+        refuse_linked_dirs(os.path.dirname(os.path.abspath(p)))
+
+    open_flags = flags | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(p, open_flags, mode)
+    try:
+        post_fst = os.fstat(fd)
+        if (
+            refuse_hardlink
+            and stat.S_ISREG(post_fst.st_mode)
+            and post_fst.st_nlink > 1
+        ):
+            raise OSError(errno.EMLINK, f"Hard link not allowed: {p!r}")
+        if os.name == "nt":
+            if pre_st is not None:
+                if (
+                    pre_st.st_ino != 0
+                    and post_fst.st_ino != 0
+                    and (pre_st.st_ino, pre_st.st_dev)
+                    != (post_fst.st_ino, post_fst.st_dev)
+                ):
+                    raise OSError(errno.ELOOP, f"File swapped during open: {p!r}")
+            else:
+                post_lst = os.lstat(p)
+                if stat.S_ISLNK(post_lst.st_mode):
+                    raise OSError(
+                        errno.ELOOP, f"Symbolic link created during open: {p!r}"
+                    )
+                reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                if getattr(post_lst, "st_file_attributes", 0) & reparse:
+                    raise OSError(
+                        errno.ELOOP, f"Reparse point created during open: {p!r}"
+                    )
+                if (
+                    post_lst.st_ino != 0
+                    and post_fst.st_ino != 0
+                    and (post_lst.st_ino, post_lst.st_dev)
+                    != (post_fst.st_ino, post_fst.st_dev)
+                ):
+                    raise OSError(errno.ELOOP, f"File swapped during open: {p!r}")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd

@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping, Optional
 
 from pydantic import BaseModel as PydanticBaseModel
@@ -105,6 +106,77 @@ class _RequestBodySizeLimitMiddleware:
             return await receive()
 
         await self._app(scope, receive_buffered, send)
+
+
+_CHART_JS_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"
+
+CONTENT_SECURITY_POLICY = "; ".join((
+    "default-src 'self'",
+    f"script-src 'self' {_CHART_JS_URL}",
+    # Rendered markup and Chart.js set inline style attributes.
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+))
+
+SECURITY_HEADERS: Mapping[str, str] = MappingProxyType({
+    "Content-Security-Policy": CONTENT_SECURITY_POLICY,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+})
+
+# FastAPI's interactive docs (served on a loopback bind only) bootstrap with an
+# inline script and CDN assets, so the page policy above would leave them blank.
+_POLICY_EXEMPT_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc"})
+
+
+class _SecurityHeadersMiddleware:
+    """Add the response headers in ``SECURITY_HEADERS`` to every HTTP response.
+
+    Pure ASGI: it rewrites only the ``http.response.start`` message and forwards
+    every body message as it arrives, so streamed responses (the training log
+    event stream) are not buffered. A header the endpoint already set is kept.
+    """
+
+    def __init__(
+        self,
+        app,
+        headers: Mapping[str, str] = SECURITY_HEADERS,
+        policy_exempt_paths: frozenset = frozenset(),
+    ) -> None:
+        self._app = app
+        self._headers = tuple(
+            (name.lower().encode("latin-1"), value.encode("latin-1"))
+            for name, value in headers.items()
+        )
+        self._policy_exempt_paths = policy_exempt_paths
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        exempt = scope.get("path") in self._policy_exempt_paths
+        extra = tuple(
+            (name, value)
+            for name, value in self._headers
+            if not (exempt and name == b"content-security-policy")
+        )
+
+        async def send_with_headers(message) -> None:
+            if message.get("type") == "http.response.start":
+                existing = list(message.get("headers", ()))
+                present = {name.lower() for name, _ in existing}
+                added = [(n, v) for n, v in extra if n not in present]
+                message = {**message, "headers": existing + added}
+            await send(message)
+
+        await self._app(scope, receive, send_with_headers)
 
 
 class TrainRequest(PydanticBaseModel):
@@ -275,6 +347,18 @@ def consume_auth_ticket(ticket: str) -> bool:
     return False
 
 
+def _bearer_matches(header_value: str) -> bool:
+    """Verify Bearer token against configured token in constant time.
+
+    Encodes both values to UTF-8 bytes before comparing, because
+    secrets.compare_digest raises TypeError if passed non-ASCII str arguments
+    (e.g. when Starlette decodes header bytes >= 0x80 using Latin-1).
+    """
+    with _auth_token_lock:
+        expected = f"Bearer {_auth_token}".encode("utf-8")
+    return secrets.compare_digest(header_value.encode("utf-8"), expected)
+
+
 def _is_loopback(host: str) -> bool:
     """Return True if host is a loopback address or localhost."""
     if host.lower() == "localhost":
@@ -362,22 +446,25 @@ def create_app(host: str = "127.0.0.1", port: int = 7860):
             allow_headers=["Authorization", "Content-Type"],
         )
 
+    # Added last, so it is the outermost layer: a 413 from the size cap, a CORS
+    # preflight and every error response carry the content policy too.
+    app.add_middleware(
+        _SecurityHeadersMiddleware,
+        policy_exempt_paths=_POLICY_EXEMPT_PATHS if _docs_enabled else frozenset(),
+    )
+
     def _verify_token(request: Request):
         """Verify Bearer token on API endpoints."""
         auth = request.headers.get("Authorization", "")
-        with _auth_token_lock:
-            expected = f"Bearer {_auth_token}"
         # Constant-time compare — a plain != leaks the token byte-by-byte via
         # response timing when `soup ui --public` is exposed on a LAN.
-        if not secrets.compare_digest(auth, expected):
+        if not _bearer_matches(auth):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     def _verify_token_or_ticket(request: Request):
         """Verify Bearer token or consume a single-use ticket for SSE streaming."""
         auth = request.headers.get("Authorization", "")
-        with _auth_token_lock:
-            expected = f"Bearer {_auth_token}"
-        if auth and secrets.compare_digest(auth, expected):
+        if auth and _bearer_matches(auth):
             return
 
         ticket = request.query_params.get("ticket", "")

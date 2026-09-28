@@ -377,7 +377,12 @@ class AsrTrainerWrapper:
             from soup_cli.utils.deepspeed import attach_empty_param_group_guard
 
             attach_empty_param_group_guard(self.trainer)
+        # LoRA+ optimizer (#724/#745) — build and attach now that the trainer exists.
+        from soup_cli.utils.peft_wiring import attach_loraplus_optimizer
+
+        attach_loraplus_optimizer(self.trainer, tcfg)
         self._output_dir = str(output_dir)
+        self._batch_size = batch_size
 
     def _unwrapped_model(self) -> Any:
         """Return the underlying Whisper model (unwrap a PEFT wrapper)."""
@@ -412,15 +417,23 @@ class AsrTrainerWrapper:
             )
         start = time.time()
         if display is not None:
-            from soup_cli.monitoring.callback import SoupTrainerCallback
+            from soup_cli.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
 
             self.trainer.add_callback(
                 SoupTrainerCallback(
-                    display, tracker=tracker, run_id=run_id,
-                    loss_watchdog=self.config.training.loss_watchdog,
-                    loss_watchdog_threshold=self.config.training.loss_watchdog_threshold,
-                    loss_watchdog_patience=self.config.training.loss_watchdog_patience,
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
                     eval_gate_config=self.config.training.eval_gate,
+                    **soup_callback_kwargs(
+                        self.config.training,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
                 )
             )
         _asr_args = getattr(self.trainer, "args", None)

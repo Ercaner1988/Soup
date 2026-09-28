@@ -273,7 +273,13 @@ class ClassifierTrainerWrapper:
             )
 
             target_modules = resolve_lora_target_modules(
-                self.model, tcfg.lora.target_modules
+                self.model, tcfg.lora.target_modules, console
+            )
+            # #1151: moe_lora picks the expert-FFN targets; see sft.py.
+            from soup_cli.utils.moe import resolve_moe_lora_targets
+
+            target_modules = resolve_moe_lora_targets(
+                self.model, tcfg, target_modules, console
             )
             lora_config = build_lora_config(
                 tcfg.lora,
@@ -377,7 +383,12 @@ class ClassifierTrainerWrapper:
             from soup_cli.utils.deepspeed import attach_empty_param_group_guard
 
             attach_empty_param_group_guard(self.trainer)
+        # LoRA+ optimizer (#724/#745) — build and attach now that the trainer exists.
+        from soup_cli.utils.peft_wiring import attach_loraplus_optimizer
+
+        attach_loraplus_optimizer(self.trainer, tcfg)
         self._output_dir = str(output_dir)
+        self._batch_size = batch_size
 
     def train(
         self,
@@ -393,15 +404,23 @@ class ClassifierTrainerWrapper:
             )
         start = time.time()
         if display is not None:
-            from soup_cli.monitoring.callback import SoupTrainerCallback
+            from soup_cli.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
 
             self.trainer.add_callback(
                 SoupTrainerCallback(
-                    display, tracker=tracker, run_id=run_id,
-                    loss_watchdog=self.config.training.loss_watchdog,
-                    loss_watchdog_threshold=self.config.training.loss_watchdog_threshold,
-                    loss_watchdog_patience=self.config.training.loss_watchdog_patience,
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
                     eval_gate_config=self.config.training.eval_gate,
+                    **soup_callback_kwargs(
+                        self.config.training,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
                 )
             )
         align_trainable_dtype_for_fp16(

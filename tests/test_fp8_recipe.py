@@ -118,18 +118,22 @@ class TestFP8RecipeRequiresFP8:
             )
         assert "quantization_aware" in str(exc.value)
 
-    def test_rowwise_with_bool_true_qat_rejected(self):
-        """Bool True = int8 QAT, not FP8 — recipe should be rejected."""
+    def test_rowwise_with_non_fp8_quantization_aware_rejected(self):
+        """A truthy value other than 'fp8' does not satisfy the recipe either.
+
+        This used `true`, which is now refused on its own (#1222) before this
+        validator runs; `quest` keeps the recipe check itself under test.
+        """
         with pytest.raises(ValidationError) as exc:
             SoupConfig(
                 base="test/model",
                 data={"train": "./data.jsonl"},
                 training={
-                    "quantization_aware": True,
+                    "quantization_aware": "quest",
                     "fp8_recipe": "rowwise",
                 },
             )
-        assert "quantization_aware" in str(exc.value)
+        assert "fp8_recipe='rowwise' requires quantization_aware='fp8'" in str(exc.value)
 
 
 # ─── Dispatch: apply_fp8_training recipe parameter ────────────────────────
@@ -137,6 +141,29 @@ class TestFP8RecipeRequiresFP8:
 
 class TestFP8RecipeDispatch:
     """apply_fp8_training passes recipe to Float8LinearConfig.from_recipe_name."""
+
+    @pytest.fixture(autouse=True)
+    def _hopper_card(self, monkeypatch):
+        """#835: apply_fp8_training now asks the hardware gate before converting.
+
+        These tests are about recipe dispatch, so they run on a Hopper card
+        (SM 9.0, every recipe admitted); ``tests/test_issue835_fp8_gate.py``
+        covers the gate. torch is patched, not the gate, because each test
+        reloads ``soup_cli.utils.fp8``.
+
+        The OS and torch's CUDA build are pinned with it: the rowwise recipes
+        need a build that has the kernel, and torch never builds it on Windows,
+        so the three Windows CI cells would otherwise fail these dispatch tests
+        (#1044 review).
+        """
+        import sys
+
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (9, 0))
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(torch.version, "cuda", "12.4")
 
     def test_apply_fp8_dispatches_tensorwise(self):
         """Default recipe passes 'tensorwise' to from_recipe_name."""
@@ -239,13 +266,17 @@ class TestFP8RecipeDispatch:
         mock_from_recipe.assert_called_once_with("rowwise_with_gw_hp")
         assert result is True
 
-    def test_apply_fp8_returns_false_when_unavailable(self):
-        """When FP8 deps are missing, apply_fp8_training returns False."""
-        from soup_cli.utils.fp8 import apply_fp8_training
+    def test_apply_fp8_stops_when_unavailable(self):
+        """INVERTED by the #835 ruling: FP8 deps missing on a card that can run
+        the recipe now raise instead of returning False."""
+        from soup_cli.utils.fp8 import FP8DependencyMissingError, apply_fp8_training
 
-        with patch("soup_cli.utils.fp8.is_fp8_available", return_value=False):
+        with patch("soup_cli.utils.fp8.is_fp8_available", return_value=False), patch(
+            "soup_cli.utils.fp8.fp8_training_supported", return_value=(True, "")
+        ):
             model = MagicMock()
-            assert apply_fp8_training(model, recipe="rowwise") is False
+            with pytest.raises(FP8DependencyMissingError):
+                apply_fp8_training(model, recipe="rowwise")
 
     def test_apply_fp8_default_recipe_is_tensorwise(self):
         """Calling without recipe= uses 'tensorwise' (v0.28.0 compat)."""
@@ -370,15 +401,14 @@ class TestFP8RecipeBackwardCompat:
         assert cfg.training.quantization_aware == "fp8"
         assert cfg.training.fp8_recipe == "tensorwise"
 
-    def test_v028_bool_true_unaffected(self):
-        """Bool True (int8 QAT) is unaffected by fp8_recipe field."""
-        cfg = SoupConfig(
-            base="test/model",
-            data={"train": "./data.jsonl"},
-            training={"quantization_aware": True},
-        )
-        assert cfg.training.quantization_aware is True
-        assert cfg.training.fp8_recipe == "tensorwise"  # default, unused
+    def test_v028_bool_true_is_refused(self):
+        """Bool True (int8 QAT) no longer loads at all (#1222)."""
+        with pytest.raises(ValidationError, match="#1222"):
+            SoupConfig(
+                base="test/model",
+                data={"train": "./data.jsonl"},
+                training={"quantization_aware": True},
+            )
 
     def test_training_config_fp8_recipe_default(self):
         """TrainingConfig alone defaults fp8_recipe to tensorwise."""
@@ -402,6 +432,10 @@ class TestFP8RecipeViaV028Features:
         tcfg.fp8_recipe = recipe
         tcfg.use_cut_ce = False
         tcfg.kernel_auto_compose = False
+        # A MagicMock attribute is truthy, so this test enabled fp8_attention by
+        # accident; harmless while that path degraded, but it now refuses on a
+        # card that cannot run the recipe (#1044 review).
+        tcfg.fp8_attention = False
 
         with patch("soup_cli.utils.fp8.apply_fp8_training", return_value=True) as m:
             from soup_cli.utils.v028_features import apply_v028_speed_memory
@@ -438,6 +472,7 @@ class TestFP8RecipeViaV028Features:
         tcfg.fp8_recipe = "rowwise"
         tcfg.use_cut_ce = False
         tcfg.kernel_auto_compose = False
+        tcfg.fp8_attention = False  # a MagicMock attribute is truthy (#1044 review)
 
         with patch("soup_cli.utils.fp8.apply_fp8_training") as m:
             from soup_cli.utils.v028_features import apply_v028_speed_memory

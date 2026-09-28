@@ -37,6 +37,9 @@ class KTOTrainerWrapper(StreamingSetupMixin):
     #: it (``kto_trainer.py`` :939-977), so the row count per forward is 1x.
     _STREAM_ROWS_PER_EXAMPLE = 1
 
+    #: The reference forward runs after the policy forward, before its backward.
+    _STREAM_REFILL_BEFORE_BACKWARD = True
+
     def __init__(
         self,
         config: SoupConfig,
@@ -226,9 +229,12 @@ class KTOTrainerWrapper(StreamingSetupMixin):
         # v0.40.6 #67 — ReLoRA callback (magnitude-prune LoRA every N steps).
         from soup_cli.utils.peft_wiring import (
             attach_curriculum_callback,
+            attach_loraplus_optimizer,
             attach_plugin_callback,
             attach_relora_callback,
         )
+        # LoRA+ optimizer (#724/#745) — build and attach now that the trainer exists.
+        attach_loraplus_optimizer(self.trainer, tcfg)
         attach_relora_callback(self.trainer, tcfg)
         # v0.53.5 #114/#115 — dynamic curriculum live callback.
         attach_curriculum_callback(self.trainer, tcfg, str(output_dir), console)
@@ -236,6 +242,7 @@ class KTOTrainerWrapper(StreamingSetupMixin):
         attach_plugin_callback(self.trainer, console)
 
         self._output_dir = str(output_dir)
+        self._batch_size = batch_size
 
     def _setup_transformers(self, cfg: SoupConfig, tcfg) -> None:
         """Load model via standard transformers + peft pipeline."""
@@ -275,14 +282,29 @@ class KTOTrainerWrapper(StreamingSetupMixin):
             cfg.data,
         )
         if tcfg.quantization in ("4bit", "8bit", "mxfp4"):
-            self.model = prepare_model_for_kbit_training(self.model)
+            from soup_cli.utils.layer_stream import should_enable_hf_gradient_checkpointing
+
+            self.model = prepare_model_for_kbit_training(
+                self.model,
+                use_gradient_checkpointing=should_enable_hf_gradient_checkpointing(
+                    tcfg.gradient_checkpointing, stream_layers=tcfg.stream_layers
+                ),
+            )
 
         from soup_cli.utils.peft_wiring import (
             build_lora_config,
             resolve_lora_target_modules,
         )
 
-        target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
+        target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules, console)
+        # #798: moe_lora picks the expert-FFN targets. Without this the flag
+        # was accepted and ignored here, and on a fused-expert MoE the auto
+        # resolution leaves peft with nothing to attach.
+        from soup_cli.utils.moe import resolve_moe_lora_targets
+
+        target_modules = resolve_moe_lora_targets(
+            self.model, tcfg, target_modules, console
+        )
 
         lora_config = build_lora_config(
             tcfg.lora,
@@ -346,15 +368,23 @@ class KTOTrainerWrapper(StreamingSetupMixin):
 
         # Add callback for live display and experiment tracking
         if display:
-            from soup_cli.monitoring.callback import SoupTrainerCallback
+            from soup_cli.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
 
             self.trainer.add_callback(
                 SoupTrainerCallback(
-                    display, tracker=tracker, run_id=run_id,
-                    loss_watchdog=self.config.training.loss_watchdog,
-                    loss_watchdog_threshold=self.config.training.loss_watchdog_threshold,
-                    loss_watchdog_patience=self.config.training.loss_watchdog_patience,
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
                     eval_gate_config=self.config.training.eval_gate,
+                    **soup_callback_kwargs(
+                        self.config.training,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
                 )
             )
 
@@ -362,6 +392,7 @@ class KTOTrainerWrapper(StreamingSetupMixin):
 
         # v0.72.4 — the shared context releases the streaming weight source even
         # if training raises (see StreamingSetupMixin._training_context).
+        self._attach_streamed_save_guard()
         with self._training_context(
             activation_offloading_context(self.config.training, self._output_dir)
         ):
@@ -375,6 +406,7 @@ class KTOTrainerWrapper(StreamingSetupMixin):
 
         # Save final model (LoRA adapter)
         self.trainer.save_model(self._output_dir)
+        self._assert_streamed_adapter_saved(self._output_dir)
         self.tokenizer.save_pretrained(self._output_dir)
 
         # Extract metrics

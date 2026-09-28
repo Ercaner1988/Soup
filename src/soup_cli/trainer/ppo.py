@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from rich.console import Console
+from rich.markup import escape
 
 from soup_cli.config.schema import SoupConfig
+from soup_cli.data.chat_templates import apply_chat_template_override
 from soup_cli.trainer.loss_summary import summarize_training_loss
 from soup_cli.utils.gpu import (
     estimate_batch_size,
@@ -143,6 +145,10 @@ class PPOTrainerWrapper:
         else:
             self._setup_transformers(cfg, tcfg)
 
+        apply_chat_template_override(
+            self.tokenizer, cfg.data.chat_template, console=console
+        )
+
         trainable, total = self.model.get_nb_trainable_parameters()
         pct = 100 * trainable / total
         console.print(
@@ -169,7 +175,7 @@ class PPOTrainerWrapper:
             console.print(f"[green]Auto batch size (PPO):[/] {batch_size}")
 
         # --- Dataset ---
-        train_data = _prepare_ppo_dataset(dataset["train"])
+        train_data = _prepare_ppo_dataset(dataset["train"], tokenizer=self.tokenizer)
         train_ds = Dataset.from_list(train_data)
 
         # Tokenize dataset: trl experimental PPOTrainer expects input_ids,
@@ -298,6 +304,48 @@ class PPOTrainerWrapper:
         # Store for use in train() — experimental API has different .train() signature
         self._is_experimental = is_experimental
 
+        # LoRA+ optimizer (#724/#745), PPO's shape. The other LoRA
+        # trainers are plain transformers.Trainer subclasses whose
+        # create_optimizer runs lazily at train(), so a post-construction
+        # attach_loraplus_optimizer lands cleanly and the scheduler is built
+        # around it. trl.experimental's PPOTrainer is not that shape: its
+        # __init__ builds the optimizer AND scheduler eagerly
+        # (create_optimizer_and_scheduler) and then calls
+        # accelerator.prepare(model, optimizer, dataloader) without the
+        # scheduler. Assigning trainer.optimizer afterwards is still stepped
+        # (B does train at lr*ratio), but self.lr_scheduler stays bound to the
+        # discarded default optimizer, so warmup and decay never reach the B
+        # group and get_last_lr() reports the wrong optimizer. Build the LoRA+
+        # optimizer up front and hand it to the constructor via
+        # optimizers=(opt, None) so create_optimizer_and_scheduler binds the
+        # scheduler to it. If trl ever makes the PPO optimizer lazy, delete this
+        # branch and let PPO join the post-construction attach.
+        #
+        # Detect the shape, not the trl version (see trainer/_trl_compat.py):
+        # the eager shape is exactly the one whose __init__ accepts an
+        # `optimizers` tuple. If a future trl.experimental drops that keyword,
+        # fail loudly here rather than silently fall back to the post-attach and
+        # reintroduce the flat-LR bug.
+        loraplus_optimizer = None
+        if getattr(tcfg, "loraplus_lr_ratio", None) is not None:
+            if "optimizers" not in ppo_trainer_params:
+                raise RuntimeError(
+                    "training.loraplus_lr_ratio is set, but this trl PPOTrainer "
+                    f"({ppo_trainer_cls.__module__}.{ppo_trainer_cls.__qualname__}) "
+                    "does not accept an `optimizers` argument, so the LoRA+ "
+                    "optimizer cannot be bound to the LR scheduler at "
+                    "construction. A post-construction attach would train the "
+                    "LoRA B group at a flat lr*ratio with warmup and decay never "
+                    "reaching it. Pin a trl whose PPO trainer takes "
+                    "optimizers=(optimizer, scheduler), or remove "
+                    "loraplus_lr_ratio for this run."
+                )
+            from soup_cli.utils.peft_wiring import build_loraplus_optimizer
+
+            loraplus_optimizer = build_loraplus_optimizer(
+                self.model, ppo_config, tcfg
+            )
+
         if is_experimental:
             # trl >=0.28 experimental API: PPOTrainer(args, processing_class,
             #   model, ref_model, reward_model, train_dataset, value_model, ...)
@@ -315,6 +363,12 @@ class PPOTrainerWrapper:
                 "train_dataset": train_ds,
                 "value_model": value_model_obj,
             }
+            # LoRA+ (#724/#745): inject so the eagerly-built scheduler binds to it.
+            if loraplus_optimizer is not None:
+                self._complete_loraplus_optimizer(
+                    loraplus_optimizer, value_model_obj, ppo_config
+                )
+                trainer_kwargs["optimizers"] = (loraplus_optimizer, None)
             self._dataset_in_constructor = True
             self.trainer = ppo_trainer_cls(**trainer_kwargs)
 
@@ -342,6 +396,12 @@ class PPOTrainerWrapper:
                 )
             if "value_model" in ppo_trainer_params:
                 trainer_kwargs["value_model"] = self._create_value_model(cfg, tcfg)
+            # LoRA+ (#724/#745): inject so the eagerly-built scheduler binds to it.
+            if loraplus_optimizer is not None:
+                self._complete_loraplus_optimizer(
+                    loraplus_optimizer, trainer_kwargs.get("value_model"), ppo_config
+                )
+                trainer_kwargs["optimizers"] = (loraplus_optimizer, None)
             self._dataset_in_constructor = (
                 "train_dataset" in trainer_kwargs or "dataset" in trainer_kwargs
             )
@@ -364,6 +424,13 @@ class PPOTrainerWrapper:
         # first step. The guard prunes inside create_optimizer, i.e. before
         # the scheduler is built. No-op for full fine-tuning, and only under
         # DeepSpeed so the ordinary path keeps its own optimizer.
+        #
+        # On PPO's eager shape (trl.experimental and the transitional branch)
+        # this guard does nothing: the trainer built its optimizer inside
+        # __init__ and trl never calls create_optimizer again. That is safe for
+        # the default optimizer, whose no-decay group is filled by the value
+        # model's biases and norm weights. The LoRA+ optimizer can have empty
+        # groups, so _complete_loraplus_optimizer prunes it before injection.
         if self.deepspeed_config:
             from soup_cli.utils.deepspeed import attach_empty_param_group_guard
 
@@ -383,6 +450,9 @@ class PPOTrainerWrapper:
         )
 
         # v0.40.6 #67 — ReLoRA callback (magnitude-prune LoRA every N steps).
+        # LoRA+ (#724/#745) is wired ABOVE via constructor injection, not here:
+        # PPO's trainer builds its scheduler eagerly, so the optimizer has to be
+        # passed to the constructor rather than attached after it.
         from soup_cli.utils.peft_wiring import (
             attach_curriculum_callback,
             attach_plugin_callback,
@@ -448,6 +518,30 @@ class PPOTrainerWrapper:
         )
         reward_model.eval()
         return reward_model
+
+    def _complete_loraplus_optimizer(self, optimizer, value_model, args):
+        """Finish the LoRA+ optimizer before it is handed to PPOTrainer (#745).
+
+        trl's default PPO optimizer covers PolicyAndValueWrapper(policy,
+        value_model); the LoRA+ one is built over the policy alone. Give the
+        value model its decay / no-decay groups at the base learning rate, or
+        no optimizer owns the critic and it never trains.
+
+        Under DeepSpeed, drop empty groups (#359): LoRA+ emits groups such as
+        embedding and groupB_no_decay that hold nothing with LoRA, DeepSpeed
+        drops them, and the scheduler built from this optimizer would keep one
+        base_lr too many. Pruning in place here, before the constructor builds
+        the scheduler, is the same order the guard enforces elsewhere.
+        """
+        from soup_cli.utils.peft_wiring import add_value_model_param_groups
+
+        if value_model is not None:
+            add_value_model_param_groups(optimizer, value_model, args)
+        if self.deepspeed_config:
+            from soup_cli.utils.deepspeed import prune_empty_param_groups
+
+            prune_empty_param_groups(optimizer)
+        return optimizer
 
     def _create_value_model(self, cfg, tcfg):
         """Create a value model for trl experimental PPO API.
@@ -525,14 +619,29 @@ class PPOTrainerWrapper:
         self.model = AutoModelForCausalLM.from_pretrained(cfg.base, **model_kwargs)
 
         if tcfg.quantization in ("4bit", "8bit", "mxfp4"):
-            self.model = prepare_model_for_kbit_training(self.model)
+            from soup_cli.utils.layer_stream import should_enable_hf_gradient_checkpointing
+
+            self.model = prepare_model_for_kbit_training(
+                self.model,
+                use_gradient_checkpointing=should_enable_hf_gradient_checkpointing(
+                    tcfg.gradient_checkpointing, stream_layers=tcfg.stream_layers
+                ),
+            )
 
         from soup_cli.utils.peft_wiring import (
             build_lora_config,
             resolve_lora_target_modules,
         )
 
-        target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules)
+        target_modules = resolve_lora_target_modules(self.model, tcfg.lora.target_modules, console)
+        # #1099: moe_lora picks the expert-FFN targets. Without this the flag
+        # was accepted and ignored here, and on a fused-expert MoE the auto
+        # resolution leaves peft with nothing to attach.
+        from soup_cli.utils.moe import resolve_moe_lora_targets
+
+        target_modules = resolve_moe_lora_targets(
+            self.model, tcfg, target_modules, console
+        )
 
         lora_config = build_lora_config(
             tcfg.lora,
@@ -614,15 +723,23 @@ class PPOTrainerWrapper:
                 self.trainer.dataset = self._train_ds
 
         if display:
-            from soup_cli.monitoring.callback import SoupTrainerCallback
+            from soup_cli.monitoring.callback import (
+                SoupTrainerCallback,
+                soup_callback_kwargs,
+            )
 
             self.trainer.add_callback(
                 SoupTrainerCallback(
-                    display, tracker=tracker, run_id=run_id,
-                    loss_watchdog=self.config.training.loss_watchdog,
-                    loss_watchdog_threshold=self.config.training.loss_watchdog_threshold,
-                    loss_watchdog_patience=self.config.training.loss_watchdog_patience,
+                    display,
+                    tracker=tracker,
+                    run_id=run_id,
                     eval_gate_config=self.config.training.eval_gate,
+                    **soup_callback_kwargs(
+                        self.config.training,
+                        batch_size=self._batch_size,
+                        output_dir=self._output_dir,
+                        include_eval_gate=False,
+                    ),
                 )
             )
 
@@ -887,7 +1004,7 @@ def _load_reward_model(
     return reward_model
 
 
-def _prepare_ppo_dataset(data: list[dict]) -> list[dict]:
+def _prepare_ppo_dataset(data: list[dict], tokenizer: Any | None = None) -> list[dict]:
     """Convert dataset rows to PPO format.
 
     PPO expects each row to have a 'prompt_text' field (string for tokenization)
@@ -910,16 +1027,68 @@ def _prepare_ppo_dataset(data: list[dict]) -> list[dict]:
             prepared.append(entry)
         elif "messages" in row:
             messages = row["messages"]
-            # Use user messages as prompt text
-            prompt_parts = [
-                msg["content"] for msg in messages if msg["role"] in ("system", "user")
-            ]
-            entry = {"prompt_text": " ".join(prompt_parts)}
+            prompt_text = None
+            if (
+                tokenizer is not None
+                and getattr(tokenizer, "chat_template", None)
+                and callable(getattr(tokenizer, "apply_chat_template", None))
+            ):
+                prompt_messages = [
+                    msg
+                    for msg in messages
+                    if isinstance(msg, dict) and msg.get("role") in ("system", "user")
+                ]
+                if not prompt_messages:
+                    prompt_messages = messages
+                try:
+                    prompt_text = tokenizer.apply_chat_template(
+                        prompt_messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception as exc:
+                    console.print(
+                        f"[yellow]Warning:[/] apply_chat_template failed: {escape(str(exc))}; "
+                        "falling back to joined text"
+                    )
+                    prompt_text = None
+            if prompt_text is None:
+                # Use user messages as prompt text
+                prompt_parts = [
+                    msg.get("content", "")
+                    for msg in messages
+                    if isinstance(msg, dict) and msg.get("role") in ("system", "user")
+                ]
+                prompt_text = " ".join(prompt_parts)
+            entry = {"prompt_text": prompt_text}
+            if "answer" in row:
+                entry["answer"] = row["answer"]
             prepared.append(entry)
         elif "prompt" in row and isinstance(row["prompt"], list):
-            # Message list → join content
-            prompt_parts = [msg.get("content", "") for msg in row["prompt"]]
-            entry = {"prompt_text": " ".join(prompt_parts)}
+            prompt_list = row["prompt"]
+            prompt_text = None
+            if (
+                tokenizer is not None
+                and getattr(tokenizer, "chat_template", None)
+                and callable(getattr(tokenizer, "apply_chat_template", None))
+            ):
+                try:
+                    prompt_text = tokenizer.apply_chat_template(
+                        prompt_list, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception as exc:
+                    console.print(
+                        f"[yellow]Warning:[/] apply_chat_template failed: {escape(str(exc))}; "
+                        "falling back to joined text"
+                    )
+                    prompt_text = None
+            if prompt_text is None:
+                # Message list → join content
+                prompt_parts = [
+                    msg.get("content", "")
+                    for msg in prompt_list
+                    if isinstance(msg, dict)
+                ]
+                prompt_text = " ".join(prompt_parts)
+            entry = {"prompt_text": prompt_text}
             if "answer" in row:
                 entry["answer"] = row["answer"]
             prepared.append(entry)
