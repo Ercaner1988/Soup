@@ -4362,8 +4362,9 @@ class ShipConfig(BaseModel):
     )
     # v0.73.2 shipped `--noise-floor` (#376) without its config surface, so it
     # was the one gate-policy flag that could not be committed to soup.yaml
-    # (#406). Bounds import from ship_verdict so the schema and the CLI
-    # validator (_validate_noise_floor_flag) share one source of truth.
+    # (#406). Bounds import from utils/config_bounds, which ship_verdict
+    # re-exports to the CLI validator (_validate_noise_floor_flag), so the two
+    # share one object.
     noise_floor: Optional[int] = Field(
         default=None,
         ge=MIN_NOISE_FLOOR_RUNS,
