@@ -178,7 +178,7 @@ soup migrate --from llamafactory config.yaml  Import config from LLaMA-Factory
 soup migrate --from axolotl config.yml        Import config from Axolotl
 soup migrate --from unsloth notebook.ipynb    Import config from Unsloth notebook
 soup migrate --from llamafactory c.yaml --dry-run  Preview without writing
-soup recipes list                             List all 174 ready-made recipes
+soup recipes list                             List all 172 ready-made recipes
 soup recipes show llama3.1-8b-sft            Print recipe YAML
 soup recipes use llama3.1-8b-sft             Copy recipe to soup.yaml
 soup recipes search "reasoning"              Search by keyword/task/size
@@ -499,7 +499,8 @@ Soup gate and verdict commands follow a unified, CI-friendly exit-code contract:
 The taxonomy applies consistently across `soup ship`, `soup eval gate`, `soup eval against`, `soup eval checklist`, `soup eval behavior`, `soup eval quant-check`, `soup lock check`, `soup expect`, `soup data validate`, `soup data lint`, and `soup recipes verify`.
 
 `soup eval checklist` requires `--evidence`. `soup eval behavior` also requires
-`--evidence` unless `--base-model` selects the live path. Omitting the required
+`--evidence` unless `--base-model` selects the live path; the `elephant` and
+`syceval` batteries cannot be scored live and exit `3` with `--base-model`. Omitting the required
 evidence exits `3` and names the JSON input to provide; it never reports a neutral
 pass for a gate that measured nothing.
 
