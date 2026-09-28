@@ -1,5 +1,6 @@
 """Pydantic schemas for soup.yaml config — single source of truth."""
 
+import math
 import re
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -1253,9 +1254,9 @@ class TrainingConfig(BaseModel):
     lr_groups: Optional[List[Dict[str, Union[str, float]]]] = Field(
         default=None,
         description=(
-            "Per-module LR override. List of {pattern, lr} entries (or a "
-            "{pattern: lr} dict). First match wins; remaining params fall "
-            "through to the base lr. Capped at 32 entries. (v0.41.0)"
+            "Staged, not applied: a per-module LR override (list of {pattern, lr} "
+            "entries or a {pattern: lr} dict, capped at 32) that no optimizer reads; "
+            "setting it warns at load, then is refused (#761). (v0.41.0)"
         ),
     )
     # v0.41.0 Part C — LLaMA Pro block expansion.
@@ -1385,8 +1386,26 @@ class TrainingConfig(BaseModel):
     )
     # GRPO-specific
     grpo_beta: float = Field(
-        default=0.1, gt=0, description="GRPO beta — KL penalty coefficient"
+        default=0.1,
+        ge=0.0,
+        allow_inf_nan=False,
+        description=(
+            "GRPO beta - KL penalty coefficient (default 0.1). Set to 0 to "
+            "disable the KL penalty entirely (KL-free recipes like DAPO and "
+            "Dr. GRPO, #1247)."
+        ),
     )
+
+    @field_validator("grpo_beta", mode="before")
+    @classmethod
+    def _validate_grpo_beta_field(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            raise ValueError("grpo_beta must not be a boolean")
+        if isinstance(v, (int, float)):
+            fval = float(v)
+            if math.isnan(fval) or math.isinf(fval):
+                raise ValueError("grpo_beta must be finite")
+        return v
     num_generations: int = Field(
         default=4, ge=2, description="Number of generations per prompt for GRPO"
     )
@@ -4231,9 +4250,9 @@ class TrainingConfig(BaseModel):
     citation_recall_threshold: Optional[float] = Field(
         default=None,
         description=(
-            "Reject final-save when measured citation recall < this "
-            "threshold. Bounded [0.0, 1.0]. Composes with v0.56.0 "
-            "diagnose-gate. (v0.62.0 Part D)"
+            "Staged, not applied: a citation-recall threshold in [0.0, 1.0] that "
+            "nothing gates a save or a run on; setting it warns at load, then is "
+            "refused (#761). (v0.62.0 Part D)"
         ),
     )
 
@@ -4452,7 +4471,7 @@ def _customized_reward_hack_tunables(tcfg: Any) -> list[str]:
     return offenders
 
 
-def _validate_reward_hack_controller(tcfg: Any) -> None:
+def _validate_reward_hack_controller(tcfg: Any, task: str = "grpo") -> None:
     """Validate the mitigation-controller config (only when a mode is active).
 
     Numeric consistency (β floor < ceil, release < trip band), the signal
@@ -4506,6 +4525,15 @@ def _validate_reward_hack_controller(tcfg: Any) -> None:
                 "exclusive with ref_model_ema_alpha (both drive the KL/ref "
                 "dynamics); pick one"
             )
+        if task == "grpo":
+            beta_val = getattr(tcfg, "grpo_beta", None)
+            if beta_val is not None and not isinstance(beta_val, bool) and float(beta_val) == 0.0:
+                raise ValueError(
+                    "grpo_beta: 0 is mutually exclusive with "
+                    f"reward_hack_mitigation={tcfg.reward_hack_mitigation!r} "
+                    "(the mitigation controller requires a positive beta to steer); "
+                    "use grpo_beta > 0 or disable mitigation"
+                )
     # v0.71.26 Stage 2 — PID / rollback tunables require pid_lagrangian mode.
     if tcfg.reward_hack_mitigation != "pid_lagrangian":
         stage2_offenders = [
@@ -4606,6 +4634,15 @@ _QUANTIZATION_UNHONOURED_TASKS = frozenset({
 #: never applied.
 _MOE_EXPERT_KNOB_TASKS = frozenset({"sft", "tts"})
 _MOE_AUX_LOSS_TASKS = frozenset({"sft", "tts", "pretrain"})
+
+#: #1264 — the tasks whose trainer has an unsloth setup: a ``_setup_unsloth`` on
+#: the wrapper (``tts`` inherits SFT's), or on every wrapper ``preference``
+#: delegates to. The other tasks have none, so ``backend: unsloth`` is not
+#: applied there at all.
+UNSLOTH_SETUP_TASKS: frozenset[str] = frozenset({
+    "sft", "dpo", "grpo", "ppo", "kto", "orpo", "simpo", "ipo", "bco", "preference",
+    "pretrain", "embedding", "tts",
+})
 
 #: The bitsandbytes values: ``4bit`` was the default, so every config Soup dumped
 #: for these tasks carries one of them literally (#795 review).
@@ -4830,7 +4867,13 @@ class SoupConfig(BaseModel):
         attaches ``utils/unsloth.py``'s fixed attention list, and SFT's vision and
         audio setups build their adapter without the MoE step, so neither reads it
         (found by a local CodeRabbit review of #1179). MLX stays declared-ignored in
-        ``backend_support`` instead, which ``soup doctor`` reports."""
+        ``backend_support`` instead, which ``soup doctor`` reports.
+
+        #1264: the refusals in this check that hold on every backend run before
+        the unsloth one, so switching backend never meets a second refusal from
+        this check, and the unsloth reason is split by
+        :data:`UNSLOTH_SETUP_TASKS`: a task with no unsloth setup does read the
+        flag; there it is the backend that goes unapplied."""
         if not self.training.moe_lora:
             return self
         tcfg = self.training
@@ -4842,12 +4885,6 @@ class SoupConfig(BaseModel):
                 "training.classifier_lora is true and training.lora.r > 0: without them that "
                 "trainer full-fine-tunes and builds no adapter for the flag to select. Set "
                 "classifier_lora: true and lora.r >= 1, or remove moe_lora."
-            )
-        if self.backend == "unsloth":
-            raise ValueError(
-                "training.moe_lora is not applied on backend='unsloth': unsloth attaches "
-                "its own fixed attention targets and never reads the flag. Use backend: "
-                "transformers, or remove moe_lora."
             )
         if self.task == "sft" and self.modality in ("vision", "audio"):
             raise ValueError(
@@ -4861,11 +4898,23 @@ class SoupConfig(BaseModel):
             "and builds no LoRA adapter of its own",
             "prm": "that trainer fine-tunes every base parameter and builds no LoRA adapter",
         }.get(self.task)
-        if why is None:
+        if why is not None:
+            raise ValueError(
+                f"training.moe_lora is not applied by task={self.task!r}: {why}. "
+                "Remove moe_lora (or set it to false)."
+            )
+        if self.backend != "unsloth":
             return self
+        if self.task in UNSLOTH_SETUP_TASKS:
+            raise ValueError(
+                "training.moe_lora is not applied on backend='unsloth': unsloth attaches "
+                "its own fixed attention targets and never reads the flag. Use backend: "
+                "transformers, or remove moe_lora."
+            )
         raise ValueError(
-            f"training.moe_lora is not applied by task={self.task!r}: {why}. "
-            "Remove moe_lora (or set it to false)."
+            f"training.moe_lora is refused with backend='unsloth': task={self.task!r} has "
+            "no unsloth setup, so backend='unsloth' is not applied to it at all. Use "
+            "backend: transformers, which applies moe_lora for this task."
         )
 
     @model_validator(mode="after")
@@ -7475,7 +7524,7 @@ class SoupConfig(BaseModel):
         # Controller config (numeric bounds, signal allowlist, β-schedule
         # mutual exclusion) only when a mode is active.
         if mitigation != "off":
-            _validate_reward_hack_controller(tcfg)
+            _validate_reward_hack_controller(tcfg, task=self.task)
         return self
 
     @model_validator(mode="after")
