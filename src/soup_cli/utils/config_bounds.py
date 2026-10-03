@@ -12,16 +12,19 @@ Keep it that way: a value that needs an import does not belong here.
 """
 
 # --- layer streaming: buffers --------------------------------------------
+
 MIN_STREAM_BUFFERS = 2
 MAX_STREAM_BUFFERS = 8
 DEFAULT_STREAM_BUFFERS = 2
 
 # --- layer streaming: disk read-ahead -----------------------------------
+
 MIN_STREAM_READ_AHEAD = 1
 MAX_STREAM_READ_AHEAD = 8
 DEFAULT_STREAM_READ_AHEAD = 2
 
 # --- layer streaming: tasks -----------------------------------------------
+
 #: Tasks whose trainers can run against a streamed base (v0.72.4).
 #:
 #: DPO and KTO take their reference model from the SAME streamed base with the
@@ -37,6 +40,7 @@ SUPPORTED_STREAM_TASKS = ("sft", "dpo", "orpo", "simpo", "kto")
 ROLLOUT_STREAM_TASKS = ("grpo", "ppo")
 
 # --- ship verdict: noise floor -----------------------------------------
+
 #: A floor needs a spread, and a spread needs at least two samples.
 MIN_NOISE_FLOOR_RUNS = 2
 #: Each run is a full pass over the base model; ten is already expensive.

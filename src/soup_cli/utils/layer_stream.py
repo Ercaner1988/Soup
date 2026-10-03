@@ -31,6 +31,7 @@ from rich.panel import Panel
 from soup_cli.utils.config_bounds import (
     DEFAULT_STREAM_BUFFERS,
     DEFAULT_STREAM_READ_AHEAD,  # noqa: F401
+
     MAX_STREAM_BUFFERS,
     MAX_STREAM_READ_AHEAD,  # noqa: F401
     MIN_STREAM_BUFFERS,

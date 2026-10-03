@@ -15,12 +15,14 @@ Three things keep that true, and each is checked here rather than trusted:
 The ``sys.modules`` checks run in a FRESH subprocess, for the reason
 ``test_cli_startup_is_light`` gives: the pytest process has already imported these
 modules through other tests, so an in-process assertion would prove nothing.
+
 """
 
 from __future__ import annotations
 
 import ast
 import importlib
+
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +40,7 @@ _PROBE = (
 # Before #780 the schema imported layer_stream, and layer_stream (and through it
 # layer_shard, async_disk_source and safetensors_reader) was on the CLI path for
 # nothing but the bounds above. Nothing else on the CLI path imports them eagerly.
+
 _OFF_THE_CLI_PATH = (
     "soup_cli.utils.layer_stream",
     "soup_cli.utils.layer_shard",
@@ -171,3 +174,4 @@ def test_old_owner_does_not_redeclare_a_bound(module):
         f"{module} assigns {sorted(assigned & leaf_names)}; these are defined once in "
         "config_bounds and only imported elsewhere."
     )
+

@@ -51,6 +51,7 @@ from soup_cli.utils.config_bounds import (  # noqa: F401 (re-exported)
     MAX_NOISE_FLOOR_RUNS,
     MIN_NOISE_FLOOR_RUNS,
 )
+
 from soup_cli.utils.terminal import strip_control as for_terminal
 
 # ---------------------------------------------------------------------------
