@@ -43,6 +43,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from soup_cli.utils.config_bounds import (
+    DEFAULT_STREAM_READ_AHEAD,
+    MAX_STREAM_READ_AHEAD,
+    MIN_STREAM_READ_AHEAD,
+)
 from soup_cli.utils.safetensors_reader import (
     SECTOR_BYTES,
     ShardIdentity,
@@ -57,9 +62,8 @@ from soup_cli.utils.safetensors_reader import (
 
 logger = logging.getLogger(__name__)
 
-MIN_STREAM_READ_AHEAD = 1
-MAX_STREAM_READ_AHEAD = 8
-DEFAULT_STREAM_READ_AHEAD = 2
+# MIN/MAX/DEFAULT_STREAM_READ_AHEAD are defined in config_bounds (imported above) so the
+# config schema can take them without importing this module (#780).
 
 #: How many byte ranges a layer's data section is read as, each by its own
 #: worker thread through its own direct-I/O handle. Measured cold on the
