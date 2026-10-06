@@ -1,5 +1,5 @@
-<!-- synced-from: README.md sha256:4dfed787f12e9d2a94ba6cf97d76b25aa4151095125c9eae65628bfe63e86d0f -->
-<p align="center">🌍 <a href="README.md">English</a> | <strong>Türkçe</strong> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a></p>
+<!-- synced-from: README.md sha256:39dcbfa5200df070b0c1d02c0dad8fd2bccea99873ce6f2f59580b18aa3eb340 -->
+<p align="center">🌍 <a href="README.md">English</a> | <strong>Türkçe</strong> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <a href="README.es.md">Español</a> | <a href="README.pt.md">Português</a> | <a href="README.zh.md">中文</a> | <a href="README.ru.md">Русский</a></p>
 
 <p align="center">
   <img src="soup.png" alt="Soup" width="280">
