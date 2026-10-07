@@ -1,5 +1,5 @@
-<!-- synced-from: README.md sha256:39dcbfa5200df070b0c1d02c0dad8fd2bccea99873ce6f2f59580b18aa3eb340 -->
-<p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <a href="README.es.md">Español</a> | <a href="README.pt.md">Português</a> | <a href="README.zh.md">中文</a> | <strong>Русский</strong></p>
+<!-- synced-from: README.md sha256:f385dc394c2a8885415f487ac35525be5b17c9eee61c25321a87342cc94d14d7 -->
+<p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <a href="README.es.md">Español</a> | <a href="README.pt.md">Português</a> | <strong>Русский</strong></p>
 
 <p align="center">
   <img src="soup.png" alt="Soup" width="280">
@@ -252,7 +252,7 @@ output: ./output
 обучения и PEFT описаны в разделе [Документация](#документация).
 
 > **Неизвестные ключи конфигурации отвергаются начиная с v0.75.** Ключ, который не объявлен ни в одной
-> модели схемы (Pydantic), — опечатка вроде `quantizaton` или поле, существующее только в более новой версии Soup, —
+> модели схемы, — опечатка вроде `quantizaton` или поле, существующее только в более новой версии Soup, —
 > раньше проходил проверку и молча отбрасывался: запуск продолжался, а настройка
 > просто не применялась. v0.74 сообщал об этом при загрузке и называл поле, которое вы, скорее всего,
 > имели в виду; начиная с **v0.75** такая же конфигурация не загружается, поэтому исправьте или удалите
@@ -320,7 +320,7 @@ Mixtral, DeepSeek R1/V3, Phi-4 и более 100 других поставляю
 | 48 GB | ~70B | Llama-3.3-70B |
 | 80 GB+ | 70B+ (полное обучение) или MoE | Mixtral-8x22B, DeepSeek-V3 |
 
-Полные таблицы моделей, включая мультимодальные, и матрица необязательных extras находятся в [`docs/models.md`](docs/models.md).
+Полные таблицы моделей и vision-моделей, а также матрица необязательных extras находятся в [`docs/models.md`](docs/models.md).
 
 ## Docker
 
