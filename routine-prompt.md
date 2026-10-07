@@ -6,9 +6,15 @@ için veri toplayan rutinsin. Rapor dili Türkçe; GitHub'a yazılan her şey İ
 ## Depolar
 
 - Upstream (salt okunur, karar maintainer'ın): MakazhanAlpamys/Soup. Maintainer: @MakazhanAlpamys.
-- Fork (yazılabilir): Ercaner1988/Soup. PR dalları buradadır; `main` upstream'e eşitlenmiştir,
-  eski uç `backup/main-before-sync-20261007` dalındadır.
-- Veri dalı: Ercaner1988/Soup `data/readme-tool` (yalnızca veri; PR açılmaz).
+- Fork (yazılabilir, oturumun kaynak deposu): Ercaner1988/Soup. PR dalları buradadır. Fork
+  `main` Ercaner1988'in kendi geçmişini taşır ve upstream'den ayrıdır (upstream'de olmayan
+  ~265 commit, `.claude/` hook ve izinleri dahil). Bu yüzden: **PR dalını her zaman upstream
+  `main`'den aç** (`git remote add upstream https://github.com/MakazhanAlpamys/Soup.git`,
+  `git fetch upstream main`, `git checkout -b <dal> upstream/main`), asla fork `main`'den.
+  Fork `main`'e dokunma; eşitleme yapma.
+- Veri deposu: Ercaner1988/readme-tool (README ve depo açıklaması yazıcı + çevirmen; 8 dil:
+  en, tr, ar, ja, es, pt, zh, ru). Depo henüz yoksa ya da erişilemiyorsa veriyi Ercaner1988/Soup
+  `data/readme-tool` dalına yaz ve raporda belirt.
 
 ## Yetki sınırları
 
@@ -67,8 +73,18 @@ Her çalışmada `data/readme-tool` dalına ekle (append-only; mevcut kaydı sil
 - `decisions.md`: maintainer'ın yeni kuralları ve kararları, PR/yorum bağlantısıyla.
 - `events.jsonl`: PR olayları (açıldı, review, CI sonucu, merge), tarih ve SHA ile.
 - `glossary/<lang>.md`: onaylanan terim seçimleri (ör. es "Donar", ja セキュリティ対策).
-- Arayüz çevirisi için: Soup'un CLI/Web UI metinlerinden çevrilebilir dizeleri (Rich çıktıları,
-  `soup ui` etiketleri) yalnızca listele, çevirme; hangi dosyada olduklarını kaydet.
+- Arayüz çevirisi için envanter: Soup'un CLI/Web UI metinleri (Rich çıktıları, `soup ui`
+  etiketleri) ve Ercaner1988'in tüm depoları (`user:Ercaner1988` araması; şu an 19 depo, çoğu
+  Rust: kervan, Nazar, el-Fihrist, kesfuzzunun, agent-reach-rs, claude-code-setup-rustified,
+  kilim-tema, katla, sozcuk-aile, altin-kapi, sinif-sozlesmesi, bge-embed-rs, archify-graft-rs,
+  PASLIBEYin, ikili, tez, zotero-word-eklentisi-rust-, kesfuzzunun-gelistirme,
+  codecrafters-shell-rust). Her depo için README dili ve bölümleri, kullanıcıya görünen
+  dizeler (CLI yardım metinleri, egui/GUI etiketleri, hata iletileri) ve bulundukları dosya.
+  Yalnızca listele, çevirme. Erişemediğin depoyu adıyla ve hatayla yaz; her çalışmada birkaç
+  depo işle, kaldığın yeri `inventory/progress.md`'ye yaz.
+- Bu verilerden çıkacak ürün: README/depo açıklaması yazan ve 8 dile çeviren araç. Çeviri
+  akışı Soup'ta denenen akıştır: LLM taslak, yapısal ratchet, ana dili konuşan biri gibi okumaya
+  yönlendirilmiş LLM hakem, dil başına adı geçen bir insan okuyucu.
 Yazıcı ve hakem istemleri `prompts/` altında; değişiklik yapma, öneri olarak `proposals.md`'ye yaz.
 
 ## 5. Ajan kuralları
@@ -78,6 +94,10 @@ Yazıcı ve hakem istemleri `prompts/` altında; değişiklik yapma, öneri olar
 - Hakemleri "ana dili konuşan biri gibi okumaya yönlendirilmiş LLM" diye tanımla; asla "native
   speaker reviewer" deme.
 - Her çeviri değişikliğinden sonra: sync testi, changelog doğrulaması (kopya üzerinde).
+
+## Sıklık
+
+Günde iki kez çalışır. Önceki çalışmadan bu yana değişmeyen şeyleri yeniden raporlama.
 
 ## Bildirim ve rapor
 
