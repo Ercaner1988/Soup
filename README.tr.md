@@ -103,7 +103,7 @@ geldi**, 22 kişiden.
   şemanın v0.40.1'den beri desteklediği kök düzeyindeki `lora:` yeniden eşlemesini uyguluyor;
   yani bu yazım reddedilmiyor, kabul ediliyor. Bu yazımı kullanan iki `soup fetch examples`
   dosyası standart `training.lora` biçimine taşındı. Tüm tarif ve şablonlar sorunsuz yükleniyor,
-  anahtar adları terminale ulaşmadan önce filtreleniyor ve tarama sınırlandırılmış durumda.
+  anahtar adları terminale ulaşmadan önce escape ediliyor ve tarama sınırlandırılmış durumda.
 - **MLX artık kabul ettiği yapılandırmayı gerçekten uyguluyor.** `train_on_responses_only`, `warmup_ratio` /
   `scheduler` / `weight_decay` / `optimizer`, `max_grad_norm`, `gradient_accumulation_steps`
   ve `gradient_checkpointing`, `backend: mlx` üzerinde tek tek doğrulanıp sonra düşürülüyordu.
@@ -435,7 +435,7 @@ bu aynı zamanda makalenin ne işe yaradığını anlatmanın en kısa yoludur:
 - **v3'te geri çekildi: "katman akışını sınırlayan GPU değil, ana bilgisayardan cihaza aktarımdır."**
   Bu, aşağıdaki H100 yeniden üretiminden yapılmış bir *çıkarımdı* ve hiç ölçülmemişti. 11 Ağustos'ta
   ölçtük ve yayımlanan yapılandırmada yanlış: ana bilgisayardan cihaza giden her baytı silmek
-  yalnızca **%1.4** kazandırıyor, hesaplama akışı adımın **%0.20**'sinde bir kopyayı bekliyor ve
+  **%1.4** kazandırıyor, hesaplama akışı adımın **%0.20**'sinde bir kopyayı bekliyor ve
   adım, o kartın aynı oturumdaki GEMM tavanının **%71.3**'ünde çalışıyor. Akışa özgü en büyük
   maliyet, %9.8 ile katman başına NF4 ters nicelemesi
   ([kayıt](benchmarks/probe-v0.73.0-what-bounds-streaming.md)). Her ölçüm geçerliliğini koruyor;
