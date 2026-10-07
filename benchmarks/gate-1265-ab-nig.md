@@ -5,6 +5,14 @@ CPU. This is the record behind the statistic and `PRIOR_SCALE_ROWS` in
 [`src/soup_cli/utils/ab_test.py`](../src/soup_cli/utils/ab_test.py). It replaces the burn-in
 of [#1227](gate-1227-ab-burn-in.md).
 
+<<<<<<< HEAD
+=======
+**Accept rule superseded by [#1418](gate-1418-ab-cs-accept.md):** `soup ab` now accepts H0
+once a confidence sequence from the same mixture lies inside +-effect_size, not at
+`log(beta/(1-alpha))`. The statistic, `PRIOR_SCALE_ROWS` and the reject rule recorded here are
+unchanged, and this record's runs are the baseline that sweep replays.
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 ## What it gates
 
 The #1227 statistic plugged the estimated variance into a likelihood ratio built for a known

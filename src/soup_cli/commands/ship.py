@@ -183,6 +183,7 @@ def _validate_judge_model_url(url: str) -> None:
     """
     from urllib.parse import urlparse
 
+<<<<<<< HEAD
     from soup_cli.utils.net_guard import refuse_private_ip_literal
 
     parsed = urlparse(url)
@@ -193,8 +194,20 @@ def _validate_judge_model_url(url: str) -> None:
             refuse_private_ip_literal(parsed.hostname, label="--judge-model")
         except ValueError as exc:
             _fail(str(exc), _EXIT_USAGE)
+=======
+    from soup_cli.utils.net_guard import LOOPBACK_HOSTS, refuse_private_ip_literal
+
+    parsed = urlparse(url)
+    if parsed.scheme == "ollama":
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         return
-    if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
+    if parsed.scheme == "https":
+        try:
+            refuse_private_ip_literal(parsed.hostname, label="--judge-model")
+        except ValueError as exc:
+            _fail(str(exc), _EXIT_USAGE)
+        return
+    if parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS:
         return
     _fail(
         f"--judge-model {url!r} uses a disallowed scheme/host; "

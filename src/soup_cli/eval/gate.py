@@ -93,9 +93,12 @@ class GateTask(BaseModel):
         if value is None:
             return None
         # Allowlist of schemes — SSRF hardening consistent with the project.
+        from soup_cli.utils.net_guard import LOOPBACK_HOSTS, refuse_private_ip_literal
+
         parsed = urlparse(value)
 
         if parsed.scheme == "ollama":
+<<<<<<< HEAD
             return value
 
         if parsed.scheme == "https":
@@ -104,9 +107,17 @@ class GateTask(BaseModel):
             from soup_cli.utils.net_guard import refuse_private_ip_literal
 
             refuse_private_ip_literal(parsed.hostname, label="judge_model URL")
+=======
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
             return value
 
-        if (parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}):
+        if parsed.scheme == "https":
+            # A private IP literal is refused when the suite is parsed, so a
+            # suite file cannot name one any more than --judge-model can.
+            refuse_private_ip_literal(parsed.hostname, label="judge_model URL")
+            return value
+
+        if parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS:
             return value
 
         raise ValueError(
@@ -415,6 +426,10 @@ def _parse_judge_url(judge_model: str) -> tuple[str, str, Optional[str]]:
     if parsed.scheme == "ollama":
         return ("ollama", judge_model[len("ollama://"):], None)
 
+    # One loopback set for every outbound gate (#1548): the shared
+    # net_guard.LOOPBACK_HOSTS decides ::1 once, here and in every caller.
+    from soup_cli.utils.net_guard import LOOPBACK_HOSTS
+
     if parsed.scheme == "https":
         # Only the OpenAI API host is given the OpenAI provider (and so
         # OPENAI_API_KEY); any other https judge is an OpenAI-compatible
@@ -425,7 +440,7 @@ def _parse_judge_url(judge_model: str) -> tuple[str, str, Optional[str]]:
             default_provider = "server"
     elif (
         parsed.scheme == "http"
-        and parsed.hostname in ("localhost", "127.0.0.1")
+        and parsed.hostname in LOOPBACK_HOSTS
     ):
         default_provider = "server"
     else:

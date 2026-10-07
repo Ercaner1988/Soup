@@ -24,6 +24,12 @@ from types import SimpleNamespace
 import pytest
 
 _REFUSED = "private/link-local/reserved IP hosts are not allowed"
+<<<<<<< HEAD
+=======
+# #1549: the refusal says what to do instead.
+_REMEDY = "address the server by its hostname"
+_UNSPECIFIED_HINT = "0.0.0.0 is ambiguous; use 127.0.0.1 or localhost"
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
 # The host part of the URL, as written in its authority.
 _NON_PUBLIC_HOSTS = [
@@ -183,6 +189,15 @@ def _online_dpo_trainer(base: str) -> None:
     )
 
 
+<<<<<<< HEAD
+=======
+def _ship_judge_model(base: str) -> None:
+    from soup_cli.commands.ship import _validate_judge_model_url
+
+    _validate_judge_model_url(f"{base}/Qwen2.5")
+
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 _VALIDATORS = [
     pytest.param(_vllm_url, id="vllm-url"),
     pytest.param(_vllm_generate, id="vllm-generate"),
@@ -268,12 +283,22 @@ class TestPublicAndLoopbackStillPass:
         "validator",
         [
             _vllm_url, _vllm_generate, _generate_openai, _generate_server, _judge_api_base,
+<<<<<<< HEAD
             _judge_evaluator, _online_dpo_field,
         ],
     )
     def test_ipv6_loopback_over_http(self, validator, sent):
         """``::1`` is loopback for these gates. The eval-gate suite, ``soup ship`` and
         the online-DPO trainer accept only ``localhost`` and ``127.0.0.1`` over http."""
+=======
+            _judge_evaluator, _online_dpo_field, _gate_suite_task, _ship_judge_model,
+            _online_dpo_trainer,
+        ],
+    )
+    def test_ipv6_loopback_over_http(self, validator, sent):
+        """``::1`` is loopback for every outbound gate: all of them accept it over
+        http through the shared ``LOOPBACK_HOSTS`` set (#1548)."""
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         try:
             validator("http://[::1]:8000")
         except _RequestAttemptedError:
@@ -326,10 +351,18 @@ class TestRemoteHttpKeepsItsMessage:
         assert sent == []
 
     @pytest.mark.parametrize("validator", [_generate_openai, _generate_server])
+<<<<<<< HEAD
     def test_unspecified_address_is_remote_to_the_scheme_check(self, validator, sent):
         """0.0.0.0 is the bind-any wildcard; these two used to count it as loopback."""
         with pytest.raises(ValueError, match="HTTPS for remote"):
             validator("http://0.0.0.0:8000")
+=======
+    def test_unspecified_address_over_http_names_the_fix(self, validator, sent):
+        """0.0.0.0 is the bind-any wildcard; #1549 says to use loopback instead."""
+        with pytest.raises(ValueError) as info:
+            validator("http://0.0.0.0:8000")
+        assert str(info.value) == f"api_base {_UNSPECIFIED_HINT}"
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         assert sent == []
 
 
@@ -417,7 +450,11 @@ class TestChatProxy:
         resp = post(f"https://{host}")
         assert resp.status_code == 400, resp.text
         detail = resp.json()["detail"]
+<<<<<<< HEAD
         assert detail == f"endpoint: {_REFUSED} (SSRF protection)"
+=======
+        assert detail == f"endpoint: {_REFUSED} (SSRF protection); {_REMEDY}"
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         assert sent == []
 
     @pytest.mark.parametrize("host", _ALLOWED_HOSTS)
@@ -427,10 +464,17 @@ class TestChatProxy:
         assert [url for url, _ in sent] == [f"https://{host}/v1/chat/completions"]
 
     def test_unspecified_address_over_http_is_refused(self, post, sent):
+<<<<<<< HEAD
         """0.0.0.0 is the bind-any wildcard; the scheme check used to count it as local."""
         resp = post("http://0.0.0.0:8000")
         assert resp.status_code == 400, resp.text
         assert resp.json()["detail"] == "HTTP only allowed for localhost endpoints"
+=======
+        """0.0.0.0 is the bind-any wildcard; #1549 says to use loopback instead."""
+        resp = post("http://0.0.0.0:8000")
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == f"endpoint {_UNSPECIFIED_HINT}"
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         assert sent == []
 
     def test_loopback_range_over_http_is_dispatched(self, post, sent):
@@ -571,7 +615,30 @@ class TestTheSharedHelper:
 
         with pytest.raises(ValueError) as info:
             refuse_private_ip_literal(host, label="vLLM URL")
+<<<<<<< HEAD
         assert str(info.value) == f"vLLM URL: {_REFUSED} (SSRF protection)"
+=======
+        assert str(info.value) == f"vLLM URL: {_REFUSED} (SSRF protection); {_REMEDY}"
+
+    def test_the_unspecified_hint_is_one_constant(self, monkeypatch):
+        """#1549: every 0.0.0.0 refusal reuses the one hint in ``net_guard``."""
+        from soup_cli.utils import hf
+        from soup_cli.utils.hubs import validate_hub_endpoint
+        from soup_cli.utils.net_guard import UNSPECIFIED_HOST_HINT
+        from soup_cli.utils.webhooks import validate_webhook_url
+
+        assert UNSPECIFIED_HOST_HINT == _UNSPECIFIED_HINT
+        monkeypatch.setenv("HF_ENDPOINT", "http://0.0.0.0:8080")
+        with pytest.raises(ValueError) as info:
+            hf.resolve_endpoint()
+        assert str(info.value) == f"HF_ENDPOINT {UNSPECIFIED_HOST_HINT}"
+        with pytest.raises(ValueError) as info:
+            validate_webhook_url("http://0.0.0.0:8080/hook")
+        assert str(info.value) == f"webhook URL {UNSPECIFIED_HOST_HINT}"
+        with pytest.raises(ValueError) as info:
+            validate_hub_endpoint("http://0.0.0.0:8080", hub="modelscope")
+        assert str(info.value) == f"modelscope {UNSPECIFIED_HOST_HINT}"
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
     def test_mapped_loopback_does_not_depend_on_the_interpreter(self, monkeypatch):
         """Whether ``IPv6Address.is_loopback`` looks through an IPv4-mapped address

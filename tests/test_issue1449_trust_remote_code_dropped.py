@@ -494,11 +494,16 @@ class TestDefaultsStayDeny:
 
     def test_training_auto_eval_callback_never_opts_in(self, monkeypatch):
         import soup_cli.commands.eval as ce
+<<<<<<< HEAD
         from soup_cli.monitoring.callback import SoupTrainerCallback
+=======
+        import soup_cli.commands.train as train_cmd
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
         calls: dict = {}
         monkeypatch.setattr(ce, "benchmark", lambda **kw: calls.__setitem__("benchmark", kw))
         monkeypatch.setattr(ce, "custom", lambda **kw: calls.__setitem__("custom", kw))
+<<<<<<< HEAD
         callback = SoupTrainerCallback.__new__(SoupTrainerCallback)
         callback.eval_config = type(
             "EvalCfg", (),
@@ -507,6 +512,15 @@ class TestDefaultsStayDeny:
         callback.output_dir = "out"
         callback.run_id = "run-1"
         callback._run_auto_eval()
+=======
+        monkeypatch.setattr(train_cmd, "_should_run_diagnose_gate_on_rank", lambda: True)
+
+        eval_config = type(
+            "EvalCfg", (),
+            {"auto_eval": True, "benchmarks": ["mmlu"], "custom_tasks": "tasks.jsonl"},
+        )()
+        train_cmd._run_auto_eval_after_training(eval_config, "out", "run-1")
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         assert calls["benchmark"]["trust_remote_code"] is False, calls
         assert calls["custom"]["trust_remote_code"] is False, calls
 

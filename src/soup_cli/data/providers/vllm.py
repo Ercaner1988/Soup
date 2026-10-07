@@ -22,7 +22,11 @@ def validate_vllm_url(base_url: str) -> None:
 
     Raises ValueError if validation fails.
     """
+<<<<<<< HEAD
     from soup_cli.utils.net_guard import refuse_private_ip_literal
+=======
+    from soup_cli.utils.net_guard import LOOPBACK_HOSTS, refuse_private_ip_literal
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
     parsed = urlparse(base_url)
     if parsed.scheme not in ("http", "https"):
@@ -32,8 +36,7 @@ def validate_vllm_url(base_url: str) -> None:
     # 0.0.0.0 is the bind-any wildcard, NOT loopback (v0.71.6 #232 hardening,
     # matching the newer SSRF validators). It drops out of the local set, so
     # http://0.0.0.0 is now rejected (remote needs HTTPS).
-    local_hosts = ("localhost", "127.0.0.1", "::1")
-    is_local = parsed.hostname in local_hosts
+    is_local = parsed.hostname in LOOPBACK_HOSTS
     if not is_local and parsed.scheme != "https":
         raise ValueError(
             f"vLLM URL must use HTTPS for remote servers (got {parsed.scheme}://). "

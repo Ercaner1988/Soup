@@ -359,6 +359,29 @@ If an issue needs hardware you do not have, say so in the claim. Several open
 issues are labelled `infra-blocked` for exactly that reason, and knowing early
 is more useful than a stalled branch.
 
+### How work is queued
+
+Review time and hosted CI are the scarce resources here, so a few rules keep the line
+moving. They are applied with judgment, not mechanically, and nothing is closed or
+released as a penalty.
+
+- **Reviews go in issue-number order.** A pull request that is green and whose review
+  rounds are answered moves up; one that waits on its author does not hold the others back.
+- **Open pull requests per author.** A contributor with fewer than 3 merged pull requests
+  can have 2 open at a time; with 3 to 9 merged, 3; with 10 or more, 5. Extra pull
+  requests are not closed: a comment says what they wait behind, and they may be
+  converted to drafts. Mark one ready for review when another lands.
+- **Claims.** Hold at most 2 claims whose pull request is not open yet. A comment without
+  a plan is read as a question, not as a claim.
+- **A quiet claim.** With no pull request and no word from you for 7 days, you get a
+  friendly check-in in the thread. If another 7 days pass without an answer, the claim is
+  released with a comment. Nothing you wrote is lost, and you can take it back.
+- **A quiet pull request.** A pull request waiting on its author for 14 days gets a ping
+  in the thread. If another 7 days pass, we close it with a note that it can be reopened
+  at any time.
+- **Full CI.** The full test matrix runs when a maintainer adds the `ci:full` label to a
+  pull request that is ready to merge, not on every push; other pushes run a quick subset.
+
 ## Making Changes
 
 ### 1. Create a Branch
@@ -528,7 +551,13 @@ as well as Ubuntu, Python 3.10 to 3.12 with 3.11 on Ubuntu only, plus the smoke
 jobs) runs when a maintainer adds the `ci:full` label at approval, and on every
 later push while the label stays. Until then the other `test (...)` checks show
 as *Expected* and the smoke jobs as *skipped*; neither is a failure on your side.
+<<<<<<< HEAD
 A PR is merged only when the full matrix is green on its current head.
+=======
+A PR is merged only when the full matrix is green on its current head. After the
+merge, `main` runs the same quick set on every commit and the full matrix once a
+night (and on every push to a `release/**` branch).
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
 See `.github/workflows/ci.yml`.
 

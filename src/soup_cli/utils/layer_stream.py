@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 from rich.panel import Panel
 
+<<<<<<< HEAD
 # The buffer, read-ahead and task bounds the config schema shares live in
 # config_bounds, a leaf with no imports, so importing the schema does not import this
 # module (and rich.panel, layer_shard, async_disk_source through it) onto the path of
@@ -32,6 +33,14 @@ from soup_cli.utils.config_bounds import (
     DEFAULT_STREAM_BUFFERS,
     DEFAULT_STREAM_READ_AHEAD,  # noqa: F401
 
+=======
+# Buffer, read-ahead and task bounds live in a dependency-free leaf so the schema
+# can import them without this module's rich subtree (#780). Re-exported here, not
+# redeclared, so the schema bound and the runtime message are the same object.
+from soup_cli.utils.config_bounds import (
+    DEFAULT_STREAM_BUFFERS,
+    DEFAULT_STREAM_READ_AHEAD,
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
     MAX_STREAM_BUFFERS,
     MAX_STREAM_READ_AHEAD,  # noqa: F401
     MIN_STREAM_BUFFERS,
@@ -73,11 +82,14 @@ PHYSICAL_RAM_TIER_HEADROOM_PERCENT = round(PHYSICAL_RAM_TIER_HEADROOM * 100)
 PIN_THROUGHPUT_GAIN_REAL = 6.56
 PIN_THROUGHPUT_GAIN_SYNTHETIC = 7.41
 
+<<<<<<< HEAD
 # --- buffers, read-ahead and tasks ------------------------------------------
 # MIN/MAX/DEFAULT_STREAM_BUFFERS, MIN/MAX/DEFAULT_STREAM_READ_AHEAD,
 # SUPPORTED_STREAM_TASKS and ROLLOUT_STREAM_TASKS are defined, with their notes, in
 # config_bounds (imported above); the names stay importable from here.
 
+=======
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 #: FLOPs per parameter per token. 6 == WITH gradient checkpointing
 #: (2 forward + 2 recompute + 2 dL/dx; base weight-grads are skipped because
 #: the base is frozen). Streaming always checkpoints, so this is never 4.

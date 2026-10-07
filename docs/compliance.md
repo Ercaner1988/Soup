@@ -140,6 +140,14 @@ argument the expectation does not take (`max_token`), is refused when the suite
 loads (exit 3), so a mistyped bound cannot silently run on the defaults. A
 top-level key other than `expectations` (a `fail_fast:` or a `name:` label
 beside it) is refused the same way, naming the key.
+<<<<<<< HEAD
+=======
+`expect_chosen_preferred_over_rejected_by_judge` requires a judge model configured
+under `args: {judge: "ollama://llama3.1", threshold: 0.7}` or passed via CLI with
+`soup expect --judge <url>`. When both are set, `--judge` takes precedence over
+the suite's `args.judge`. Without a judge configured, the gate fails (or pass
+`args: {advisory: true}` to explicitly trust existing labels in advisory mode).
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
 Scanned fields per format:
 - ChatML / tool-calling / audio: every `messages[].content` (string or text parts), tool-call arguments (per message and top-level `tool_calls`), and `tools[].function.description`.

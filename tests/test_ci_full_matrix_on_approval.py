@@ -7,9 +7,16 @@ three matrices by event:
 
 * RELEASE, every cell of the 3x3 support matrix, for pushes to ``release/**``
   -- the release checklist needs all of them green on the tagged commit;
+<<<<<<< HEAD
 * FULL, the same minus Windows and macOS on 3.11, for pushes to ``main`` and
   pull requests a maintainer has labelled ``ci:full``;
 * QUICK, ``test (ubuntu-latest, 3.12)`` alone, for any other pull-request run.
+=======
+* FULL, the same minus Windows and macOS on 3.11, for the nightly run on ``main``,
+  a manual dispatch, and pull requests a maintainer has labelled ``ci:full``;
+* QUICK, ``test (ubuntu-latest, 3.12)`` alone, for a push to ``main`` and for any
+  other pull-request run.
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
 The merge gate survives that because of one shape, and these tests pin it: the
 ``test`` job's matrix is whatever the ``plan`` job outputs, so a quick run never
@@ -335,19 +342,46 @@ def _render(template: str, context: dict[str, Any]) -> str:
     )
 
 
+<<<<<<< HEAD
 def _push(ref: str = "refs/heads/main", *, run_id: str = "900") -> dict[str, Any]:
+=======
+def _push(
+    ref: str = "refs/heads/main", *, run_id: str = "900", sha: str = "a" * 40
+) -> dict[str, Any]:
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
     return {
         "github": {
             "workflow": "CI",
             "event_name": "push",
             "ref": ref,
+<<<<<<< HEAD
             "sha": "a" * 40,
+=======
+            "sha": sha,
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
             "run_id": run_id,
             "event": {"ref": ref},
         }
     }
 
 
+<<<<<<< HEAD
+=======
+def _on_event(event_name: str, *, run_id: str = "800") -> dict[str, Any]:
+    """A ``schedule`` or ``workflow_dispatch`` context: both run on main's tip."""
+    return {
+        "github": {
+            "workflow": "CI",
+            "event_name": event_name,
+            "ref": "refs/heads/main",
+            "sha": "c" * 40,
+            "run_id": run_id,
+            "event": {},
+        }
+    }
+
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 def _pull_request(
     action: str,
     *,
@@ -394,7 +428,13 @@ def _release_for(context: dict[str, Any]) -> str:
 #: Which matrix each event must get: the one table both the expression tests and
 #: the end-to-end run of the step's shell read.
 EVENTS = [
+<<<<<<< HEAD
     pytest.param(_push("refs/heads/main"), "FULL", id="push-main"),
+=======
+    pytest.param(_push("refs/heads/main"), "QUICK", id="push-main"),
+    pytest.param(_on_event("schedule"), "FULL", id="nightly"),
+    pytest.param(_on_event("workflow_dispatch"), "FULL", id="manual-dispatch"),
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
     pytest.param(_push("refs/heads/release/v0.76.0"), "RELEASE", id="push-release"),
     pytest.param(_pull_request("opened"), "QUICK", id="pr-opened"),
     pytest.param(_pull_request("synchronize", labels=("bug",)), "QUICK", id="pr-push-other-label"),
@@ -466,6 +506,18 @@ class TestTriggers:
     def test_pushes_to_main_and_release_branches_still_trigger(self):
         assert _triggers()["push"]["branches"] == ["main", "release/**"]
 
+<<<<<<< HEAD
+=======
+    def test_the_nightly_full_run_and_the_manual_dispatch_exist(self):
+        """A push to main runs only the quick set, so the full matrix on main has to come
+        from somewhere: without these two the seven-cell run would never happen on main."""
+        triggers = _triggers()
+        schedule = triggers.get("schedule")
+        assert isinstance(schedule, list) and len(schedule) == 1, schedule
+        assert str(schedule[0].get("cron", "")).count(" ") == 4, schedule
+        assert "workflow_dispatch" in triggers
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
 class TestPlanDecision:
     def test_plan_is_short_unconditional_and_exports_its_decision(self):
@@ -486,6 +538,23 @@ class TestPlanDecision:
         assert _full_for(context) == ("false" if kind == "QUICK" else "true")
 
 
+<<<<<<< HEAD
+=======
+class TestTheBadgeStep:
+    def test_the_test_count_badge_is_updated_by_the_nightly_run(self):
+        """The badge step needs the ubuntu / 3.11 cell, which a push to main no longer runs
+        (it runs ubuntu / 3.12 only), so it moved to the nightly full run. A condition still
+        gated on a push would never fire again and the badge would silently go stale."""
+        steps = _jobs()["test"]["steps"]
+        badge = [step for step in steps if step.get("name") == "Update test count badge"]
+        assert len(badge) == 1, badge
+        condition = str(badge[0].get("if", ""))
+        assert "github.event_name == 'schedule'" in condition, condition
+        assert "github.event_name == 'push'" not in condition, condition
+        assert "github.ref == 'refs/heads/main'" in condition, condition
+
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 class TestGatedJobs:
     @pytest.mark.parametrize("name", GATED_JOBS)
     def test_the_smoke_and_contract_jobs_run_only_on_a_full_run(self, name):
@@ -583,6 +652,22 @@ class TestConcurrency:
             assert push != _group(_pull_request("synchronize", run_id="1"))
             assert push != _group(_pull_request("labeled", label="bug", run_id="1"))
 
+<<<<<<< HEAD
+=======
+    def test_two_pushes_to_main_never_share_a_group(self):
+        """Every main commit gets its own run. A shared group keeps one pending run and cancels
+        the rest, which is how 22 merges in two hours left 'cancelled' on all but two."""
+        first = _group(_push("refs/heads/main", run_id="1", sha="1" * 40))
+        second = _group(_push("refs/heads/main", run_id="2", sha="2" * 40))
+        assert first != second
+
+    def test_the_nightly_and_manual_runs_are_not_in_the_group_of_a_push_to_the_same_commit(self):
+        push = _group(_push("refs/heads/main", run_id="1", sha="c" * 40))
+        assert _group(_on_event("schedule")) != push
+        assert _group(_on_event("workflow_dispatch")) != push
+        assert _group(_on_event("schedule")) != _group(_on_event("workflow_dispatch"))
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
     def test_cancellation_stays_pull_request_only(self):
         concurrency = _workflow()["concurrency"]
         assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"

@@ -24,7 +24,11 @@ from soup_cli.utils.diagnose.report import (
 )
 from tests.conftest import strip_ansi
 
+<<<<<<< HEAD
 DATASET_MODES = ("forgetting", "format", "mode_collapse", "memorization")
+=======
+DATASET_MODES = ("format", "mode_collapse", "memorization")
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
 RECOGNISED = [
     {"prompt": f"Write story number {i}.", "completion": f"Once upon a time {i}."}
@@ -268,11 +272,19 @@ class TestCli:
         svg = (tmp_path / "b.svg").read_text(encoding="utf-8")
         assert "NOT_RUN" in svg  # the overall pill
         assert "#8b949e" in svg
+<<<<<<< HEAD
         # The four dataset probes show "not run", never a stored 0.00 placeholder.
         assert svg.count("not run") == 4
         assert "0.00" not in svg
         # Only refusal, contamination and citation are OK (green); the pill is grey.
         assert svg.count("#3fb950") == 3
+=======
+        # The three dataset probes show "not run", never a stored 0.00 placeholder.
+        assert svg.count("not run") == 3
+        assert "0.00" not in svg
+        # Refusal, forgetting, contamination and citation are OK (green); the pill is grey.
+        assert svg.count("#3fb950") == 4
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 
     def test_bad_tokenizer_exits_3_before_model_load(self, tmp_path, monkeypatch):
         with mock.patch(
@@ -425,12 +437,20 @@ class TestReviewFollowUps:
             tmp_path, monkeypatch, UNRECOGNISED, _gens(), "--allow-not-run"
         )
         assert result.exit_code == 0
+<<<<<<< HEAD
         modes = ("forgetting", "format", "mode_collapse", "memorization")
+=======
+        modes = ("format", "mode_collapse", "memorization")
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         rows = [
             line for line in out.splitlines()
             if "NOT_RUN" in line and any(mode in line for mode in modes)
         ]
+<<<<<<< HEAD
         assert len(rows) == 4  # one table row per NOT_RUN probe, not the overall panel
+=======
+        assert len(rows) == 3  # one table row per NOT_RUN probe, not the overall panel
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
         for line in rows:
             assert "\u2014" in line
             assert "0.000" not in line

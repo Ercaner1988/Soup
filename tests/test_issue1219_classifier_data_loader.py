@@ -47,6 +47,21 @@ def _strip_ansi(text: str) -> str:
     return " ".join(plain.split())
 
 
+<<<<<<< HEAD
+=======
+def _local_base_model_dir() -> str:
+    """A tiny Llama causal LM + tokenizer built locally (no download),
+    standing in for hf-internal-testing/tiny-random-LlamaForCausalLM -- #1356
+    found these tests pulling it from the Hub just to initialise a
+    classification head on top, which a randomly-initialised base serves
+    identically. Shared and cached across every file that needs one
+    (tests/_tiny_hf_models.py)."""
+    from tests._tiny_hf_models import tiny_model_dir
+
+    return tiny_model_dir("llama")
+
+
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
 class TestTaskPreservesSourceColumns:
     """One helper decides which tasks keep source columns; train and sweep must agree."""
 
@@ -400,7 +415,11 @@ class TestDatasetVariantsLoading:
         data_file.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 
         cfg_obj = {
+<<<<<<< HEAD
             "base": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+=======
+            "base": _local_base_model_dir(),
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
             "task": task,
             "data": {
                 "train": data_file.as_posix(),
@@ -451,7 +470,11 @@ class TestDocumentedExampleTraining:
         cfg_file = tmp_path / "cls.yaml"
         cfg_file.write_text(
             f"""
+<<<<<<< HEAD
             base: hf-internal-testing/tiny-random-LlamaForCausalLM
+=======
+            base: {Path(_local_base_model_dir()).as_posix()}
+>>>>>>> 6b7356730180d6afbdc029cdcd280e225fd26a82
             task: classifier
             data:
               train: {data_path.as_posix()}
