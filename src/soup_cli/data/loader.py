@@ -18,6 +18,7 @@ from soup_cli.data.formats import (
     format_to_messages_with_reason,
     is_audio_format,
     is_vision_format,
+    unify_preference_layout,
 )
 from soup_cli.utils.paths import is_under_cwd
 
@@ -408,11 +409,34 @@ def _finalize(
                 f"used {report.n_replay} (short {report.shortfall}). Rows are "
                 "NOT repeated.[/]"
             )
+
+    # #1849: text and conversational preference rows cannot share a dataset
+    # (one Arrow type per column; trl reads the layout off the first row).
+    # Here rather than per file, so interleaved files in different layouts are
+    # covered too. trl prepares train and val separately.
+    for split in ("train", "val"):
+        rows = result.get(split)
+        if not isinstance(rows, list):
+            continue
+        unified, rewritten = unify_preference_layout(rows)
+        if rewritten:
+            result[split] = unified
+            what, each = (
+                ("is a plain-text preference row", "It")
+                if rewritten == 1
+                else ("are plain-text preference rows", "Each")
+            )
+            console.print(
+                f"[yellow]Note: {rewritten} of {len(unified)} {split} rows {what} in a "
+                f"dataset whose other rows are conversations. {each} was rewritten as one "
+                "user turn and one assistant turn per answer, so the whole split goes "
+                "through the chat template.[/]"
+            )
     return result
 
 
 def _classify_train_entry(value: str) -> str:
-    """Classify one data.train list entry for interleave dispatch (#459).
+    """Classify one data.train entry: a list element (#459) or the single string.
 
     Returns ``'remote'`` / ``'hub'`` / ``'local'``. Mirrors the identical
     classification in schema._classify_data_train_entry — kept
@@ -453,7 +477,9 @@ def load_dataset(
 
     Supports:
     - Local files (.jsonl, .json, .csv, .parquet, .txt)
-    - HuggingFace dataset names (auto-detected if no file extension)
+    - HuggingFace dataset names (any string that is neither a local file nor a
+      remote URI; a dot in the name, as in ``teknium/OpenHermes-2.5``, does not
+      make it a file)
     - Remote fsspec URIs (s3://, gs://, gcs://, az://, abfs://, abfss://, oci://) — v0.53.8 #85
     - A list of >= 2 local files / remote URIs combined via data.interleave
       (#443 local files; #459 widened to remote URIs when data.streaming is
@@ -494,8 +520,14 @@ def load_dataset(
             preserve_source_columns=preserve_source_columns,
         )
 
-    # Check if it's a HuggingFace dataset
-    if not Path(train_path).suffix:
+    # Hub id or local file: the list form's rule, so one dataset name takes the
+    # same route in both spellings (a dot in ``teknium/OpenHermes-2.5`` is not a
+    # file extension). One addition: a string with a suffix that is an existing
+    # file stays local, so a real ``data.tsv`` still gets "Unsupported file
+    # format" instead of a Hub lookup.
+    if _classify_train_entry(train_path) == "hub" and not (
+        Path(train_path).suffix and os.path.isfile(train_path)
+    ):
         return _load_hf_dataset(
             train_path,
             data_config,
@@ -1019,7 +1051,8 @@ def _load_interleaved_streaming_datasets(
 def _validate_vision_images(data: list[dict], image_dir: Path) -> list[dict]:
     """Validate and resolve image paths in vision dataset rows.
 
-    Each row must have an 'image' key with a filename or path. Resolves
+    Each row must have an 'image' key with a filename or path, a decoded PIL
+    image, or a datasets Image struct ({'bytes': ..., 'path': ...}). Resolves
     relative paths against image_dir and rejects path traversal — a crafted
     llava/sharegpt4v row like ``{"image": "/etc/passwd"}`` must not be handed
     to ``PIL.Image.open``. Mirrors :func:`_validate_audio_files` (the sibling
@@ -1125,6 +1158,36 @@ def _resolve_media_entries(
             entries.append(None)
             continue
         if not isinstance(value, str):
+            if isinstance(value, dict):
+                # Struct with embedded bytes passes through unchanged
+                if value.get("bytes"):
+                    entries.append(row)
+                    continue
+                path_val = value.get("path")
+                if path_val:
+                    if isinstance(path_val, (bytes, os.PathLike)):
+                        outside += 1
+                        entries.append(None)
+                        continue
+                    if not isinstance(path_val, str):
+                        missing += 1
+                        entries.append(None)
+                        continue
+                    if media_dir is None:
+                        raise _media_dir_required(source, key, plural=plural)
+                    if "\x00" in path_val or is_network_or_device_path(path_val):
+                        outside += 1
+                        entries.append(None)
+                        continue
+                    media_path = Path(path_val)
+                    if not media_path.is_absolute():
+                        media_path = media_dir / media_path
+                    if not is_under(media_path, media_dir):
+                        outside += 1
+                        entries.append(None)
+                        continue
+                    entries.append({**row, key: {**value, "path": str(media_path.resolve())}})
+                    continue
             entries.append(row)
             continue
         if media_dir is None:

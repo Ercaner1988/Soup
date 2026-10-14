@@ -235,7 +235,7 @@ def load_quant_config(path: object) -> Mapping[str, Any]:
     * ``yaml.safe_load`` only
     * 256 KB size cap
     """
-    import yaml
+    from soup_cli.utils.yaml_limits import load_yaml_file_limited
 
     validated_shape = validate_quant_config_path(path)
     _enforce_under_cwd_and_no_symlink(validated_shape, "quant_config")
@@ -255,8 +255,9 @@ def load_quant_config(path: object) -> Mapping[str, Any]:
             f"quant_config too large ({size} bytes; "
             f"cap {_MAX_QUANT_CONFIG_BYTES})"
         )
-    with open(validated_shape, encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+    data = load_yaml_file_limited(
+        validated_shape, "quant_config", max_bytes=_MAX_QUANT_CONFIG_BYTES
+    )
     if data is None:
         return {}
     if not isinstance(data, dict):

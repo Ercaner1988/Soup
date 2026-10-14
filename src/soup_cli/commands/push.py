@@ -380,12 +380,17 @@ def _load_training_config(model_path: Path) -> dict:
             import yaml
         except ImportError:
             return {}
+        from soup_cli.utils.yaml_limits import (
+            MAX_CONFIG_BYTES,
+            YamlLimitError,
+            load_yaml_file_limited,
+        )
+
         try:
-            with open(path, encoding="utf-8") as fh:
-                data = yaml.safe_load(fh)
+            data = load_yaml_file_limited(path, name, max_bytes=MAX_CONFIG_BYTES)
             if isinstance(data, dict):
                 return data
-        except (yaml.YAMLError, OSError):
+        except (yaml.YAMLError, YamlLimitError, OSError):
             continue
     return {}
 

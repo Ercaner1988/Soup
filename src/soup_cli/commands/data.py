@@ -13,11 +13,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from soup_cli.data.loader import load_raw_data
+from soup_cli.data.loader import _resolve_media_entries, load_raw_data
 from soup_cli.data.validator import validate_and_stats
 from soup_cli.utils.embed import DEFAULT_EMBED_MODEL, embed_texts
 from soup_cli.utils.exit_codes import EXIT_GATE_FAILED, EXIT_USAGE_ERROR, GateCommand
-from soup_cli.utils.paths import is_network_or_device_path, is_under_cwd
+from soup_cli.utils.paths import is_under_cwd
 from soup_cli.utils.semdedup import DedupReport, greedy_semdedup
 from soup_cli.utils.terminal import for_terminal
 
@@ -30,14 +30,17 @@ app = typer.Typer(no_args_is_help=True)
 def inspect(
     path: str = typer.Argument(..., help="Path to dataset file (jsonl, csv, parquet)"),
     rows: int = typer.Option(5, "--rows", "-r", help="Number of sample rows to show"),
+    image_dir: Optional[str] = typer.Option(
+        None, "--image-dir", help="Directory containing referenced images"
+    ),
 ):
     """Inspect a dataset: show stats and sample rows."""
     file_path = Path(path)
     if not file_path.exists():
-        console.print(f"[red]File not found: {file_path}[/]")
+        console.print(f"[red]File not found: {for_terminal(file_path)}[/]")
         raise typer.Exit(1)
 
-    console.print(f"[dim]Inspecting {file_path}...[/]\n")
+    console.print(f"[dim]Inspecting {for_terminal(file_path)}...[/]\n")
     data = load_raw_data(file_path)
     result = validate_and_stats(data)
 
@@ -46,7 +49,7 @@ def inspect(
     stats_table.add_column("Metric", style="bold")
     stats_table.add_column("Value")
     stats_table.add_row("Total samples", str(result["total"]))
-    stats_table.add_row("Columns", ", ".join(result["columns"]))
+    stats_table.add_row("Columns", ", ".join(for_terminal(col) for col in result["columns"]))
     stats_table.add_row("Avg length (chars)", str(result["avg_length"]))
     stats_table.add_row("Min length", str(result["min_length"]))
     stats_table.add_row("Max length", str(result["max_length"]))
@@ -55,22 +58,20 @@ def inspect(
     console.print(stats_table)
 
     # Vision stats (if dataset contains images)
-    _show_vision_stats(data)
+    image_root = Path(image_dir) if image_dir else file_path.parent
+    _show_vision_stats(data, image_root)
 
     # Print sample rows
     if rows > 0 and len(data) > 0:
-        # Escape dataset-derived cell content + column names: a stray '[/]' in
-        # ordinary data crashes Rich with MarkupError; a crafted '[link=...]'
-        # renders a phishing hyperlink. Mirrors `soup data review`.
-        from rich.markup import escape as _escape
+        # Sanitize dataset-derived cells and column names before Rich renders them.
 
         console.print(f"\n[bold]Sample rows ({min(rows, len(data))}):[/]")
         sample_table = Table(show_lines=True)
         for col in result["columns"][:5]:  # max 5 columns
-            sample_table.add_column(_escape(str(col)), max_width=60)
+            sample_table.add_column(for_terminal(col), max_width=60)
         for row in data[: min(rows, len(data))]:
             values = [
-                _escape(str(row.get(col, ""))[:60])
+                for_terminal(str(row.get(col, ""))[:60])
                 for col in result["columns"][:5]
             ]
             sample_table.add_row(*values)
@@ -116,9 +117,9 @@ def validate(
 
         try:
             fmt = detect_format(data)
-            console.print(f"[dim]Auto-detected format: {fmt}[/]")
+            console.print(f"[dim]Auto-detected format: {for_terminal(fmt)}[/]")
         except ValueError as exc:
-            console.print(f"[red]{exc}[/]")
+            console.print(f"[red]{for_terminal(str(exc))}[/]")
             raise typer.Exit(EXIT_USAGE_ERROR)
 
     result = validate_and_stats(data, expected_format=fmt)
@@ -126,13 +127,13 @@ def validate(
     if result["issues"]:
         console.print("[yellow]Issues found:[/]")
         for issue in result["issues"]:
-            console.print(f"  [yellow]![/] {issue}")
+            console.print(f"  [yellow]![/] {for_terminal(issue)}")
     else:
         console.print("[bold green]Dataset is valid![/]")
 
     valid = result["valid_rows"]
     total = result["total"]
-    console.print(f"\n[green]{valid}/{total} rows valid for {fmt} format[/]")
+    console.print(f"\n[green]{valid}/{total} rows valid for {for_terminal(fmt)} format[/]")
 
     if total > 0 and valid == 0:
         console.print("[red]Validation failed: no usable rows remain.[/]")
@@ -674,10 +675,13 @@ def stats(
         )
 
 
-def _show_vision_stats(data: list[dict]) -> None:
+def _show_vision_stats(data: list[dict], image_dir: Path | None = None) -> None:
     """Show image statistics if dataset contains image fields."""
     if not data:
         return
+
+    if image_dir is None:
+        image_dir = Path.cwd()
 
     # Check if this is a vision dataset
     sample = data[0]
@@ -690,16 +694,22 @@ def _show_vision_stats(data: list[dict]) -> None:
 
     # Collect image file info
     extensions: dict[str, int] = {}
+    entries, _, outside = _resolve_media_entries(
+        data, "image", image_dir, source="data.inspect"
+    )
+
     existing = 0
-    for row in data:
-        img_path = row.get("image", "")
-        if not img_path or not isinstance(img_path, str):
+    for row in entries:
+        if row is None:
             continue
+
+        img_path = row.get("image")
+        if not isinstance(img_path, str):
+            continue
+
         ext = Path(img_path).suffix.lower()
         extensions[ext] = extensions.get(ext, 0) + 1
-        # A network share or a device path is never looked up, nor counted as found.
-        if is_network_or_device_path(img_path):
-            continue
+
         if Path(img_path).exists():
             existing += 1
 
@@ -709,9 +719,14 @@ def _show_vision_stats(data: list[dict]) -> None:
     vision_table.add_row("Images referenced", str(has_image))
     vision_table.add_row("Missing image field", str(missing_image))
     vision_table.add_row("Images found on disk", str(existing))
+    vision_table.add_row("Images outside image directory", str(outside))
+
     if extensions:
-        ext_str = ", ".join(f"{ext} ({count})" for ext, count in sorted(extensions.items()))
-        vision_table.add_row("Image formats", ext_str)
+        ext_str = ", ".join(
+            f"{ext} ({count})" for ext, count in sorted(extensions.items())
+        )
+        vision_table.add_row("Image formats", for_terminal(ext_str))
+
     console.print(vision_table)
 
 
@@ -2241,7 +2256,6 @@ def review_cmd(
     """Preview preference pairs for manual review."""
     import json as _json
 
-    from rich.markup import escape as _escape
     from rich.panel import Panel
 
     sample = max(1, min(int(sample), 100))
@@ -2266,9 +2280,9 @@ def review_cmd(
             chosen = str(entry.get("chosen", ""))
             rejected = str(entry.get("rejected", ""))
             console.print(Panel(
-                f"[bold cyan]Prompt:[/] {_escape(prompt[:400])}\n\n"
-                f"[green]Chosen:[/] {_escape(chosen[:400])}\n\n"
-                f"[red]Rejected:[/] {_escape(rejected[:400])}",
+                f"[bold cyan]Prompt:[/] {for_terminal(prompt[:400])}\n\n"
+                f"[green]Chosen:[/] {for_terminal(chosen[:400])}\n\n"
+                f"[red]Rejected:[/] {for_terminal(rejected[:400])}",
                 title=f"Pair {shown + 1}",
                 border_style="blue",
             ))
