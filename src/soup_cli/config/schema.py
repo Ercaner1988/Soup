@@ -1284,7 +1284,9 @@ class TrainingConfig(BaseModel):
         default=None, ge=1, le=64,
         description=(
             "LLaMA Pro: append N zero-init transformer blocks and freeze "
-            "the original ones before SFT or pre-training."
+            "the original ones, so only the new blocks train. A LoRA rank is "
+            "refused with it, since get_peft_model would freeze the new blocks "
+            "again (#1326): set lora.r: 0 and quantization: none on task: sft."
         ),
     )
     freeze_trainable_layers: Optional[int] = Field(
@@ -5059,6 +5061,51 @@ class SoupConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_expand_layers_lora(self) -> "SoupConfig":
+        """#1326 - LLaMA Pro under LoRA does not train the appended blocks.
+
+        The block expansion freezes everything but the new blocks, then
+        ``get_peft_model`` runs and freezes every non-adapter parameter again,
+        new blocks included, while adapters land on every targeted layer. With
+        the default ``q_proj``/``v_proj`` targets the new blocks also stay the
+        identity (their zero-initialised ``o_proj``/``down_proj`` are frozen), so
+        only the original layers learn. Route 1 of the ruling: refuse the
+        combination; ``lora.r: 0`` trains the new blocks directly, and is
+        available on ``task: sft`` only.
+        """
+        tcfg = self.training
+        if tcfg.expand_layers is None or tcfg.lora.r == 0:
+            return self
+        if (
+            tcfg.stream_layers
+            or tcfg.unfrozen_parameters
+            or tcfg.lisa_enabled
+            or tcfg.quantization_aware == "quest"
+        ):
+            # Streaming, Spectrum, LISA and QuEST refuse expand_layers outright in
+            # their own validators. Let that message speak: lora.r: 0 would not
+            # make such a config load.
+            return self
+        fields = (
+            f"training.expand_layers: {tcfg.expand_layers} with "
+            f"training.freeze_trainable_layers: {tcfg.freeze_trainable_layers} "
+            f"(LLaMA Pro) cannot be combined with LoRA (training.lora.r: "
+            f"{tcfg.lora.r}). get_peft_model runs after the block expansion and "
+            "freezes the appended blocks again, so only adapters on the original "
+            "layers would train. "
+        )
+        if self.task == "pretrain":
+            raise ValueError(
+                fields + "Training only the new blocks needs lora.r: 0, which "
+                "task: pretrain does not support, so this recipe needs task: sft "
+                "with lora.r: 0 and quantization: none."
+            )
+        raise ValueError(
+            fields + "To train only the new blocks, set lora.r: 0 with "
+            "quantization: none."
+        )
+
+    @model_validator(mode="after")
     def _validate_v042_pre_tokenized_modality(self) -> "SoupConfig":
         if self.data.format == "pre_tokenized" and self.modality != "text":
             raise ValueError(
@@ -5548,7 +5595,8 @@ class SoupConfig(BaseModel):
 
         Delegates to :func:`grpo_long_context.validate_long_context_grpo_compat`
         so the rules are single-source-of-truth (mirrors v0.49.0 LongLoRA).
-        Staged field is accepted but unconsumed, and refused as of v0.77 (#808).
+        Staged field is accepted but unconsumed; the release that refuses it is
+        named once, in ``config/staged_fields.py`` (#808).
         """
         if not self.training.long_context_grpo:
             return self
@@ -5997,9 +6045,16 @@ class SoupConfig(BaseModel):
         """
         tcfg = self.training
         if tcfg.use_liger and self.task not in SFT_KERNEL_AWARE_TASKS:
+            # #1425: a blend reads the logits of the trainer's forward pass.
+            blend = (
+                ". A preference_loss_weights blend could not use it either: trl's "
+                "Liger loss returns no logits for the blend to read."
+                if self.task == "preference" and tcfg.preference_loss_weights
+                else ""
+            )
             raise ValueError(
                 f"training.use_liger=true requires task in "
-                f"{sorted(SFT_KERNEL_AWARE_TASKS)}; got task={self.task!r}"
+                f"{sorted(SFT_KERNEL_AWARE_TASKS)}; got task={self.task!r}{blend}"
             )
         if tcfg.use_flash_attn and self.task not in SFT_KERNEL_AWARE_TASKS:
             raise ValueError(
@@ -6057,9 +6112,9 @@ class SoupConfig(BaseModel):
                         f"(trainer/sft.py), so it would be stored and never take "
                         f"effect. Remove it, or use one of those tasks."
                     )
+        default_aux = type(tcfg).model_fields["moe_aux_loss_coeff"].default
         if self.task not in _MOE_AUX_LOSS_TASKS:
-            default = type(tcfg).model_fields["moe_aux_loss_coeff"].default
-            if tcfg.moe_aux_loss_coeff != default:
+            if tcfg.moe_aux_loss_coeff != default_aux:
                 raise ValueError(
                     f"training.moe_aux_loss_coeff={tcfg.moe_aux_loss_coeff!r} is "
                     f"not applied by task={self.task!r}: only "
@@ -6071,13 +6126,28 @@ class SoupConfig(BaseModel):
             # #1394: only SFT's text setup reads it. The vision and audio setups
             # build their model without the MoE step, the same gap #1179 closed
             # for moe_lora on these paths.
-            default = type(tcfg).model_fields["moe_aux_loss_coeff"].default
-            if tcfg.moe_aux_loss_coeff != default:
+            if tcfg.moe_aux_loss_coeff != default_aux:
                 raise ValueError(
                     f"training.moe_aux_loss_coeff={tcfg.moe_aux_loss_coeff!r} is "
                     f"not applied by task='sft' with modality={self.modality!r}: "
                     "that setup never applies the MoE auxiliary loss. Remove it, "
                     "or train with modality: text."
+                )
+        if self.backend == "unsloth":
+            # #1412: unsloth loader never applies the MoE auxiliary loss coefficient.
+            if tcfg.moe_aux_loss_coeff != default_aux:
+                raise ValueError(
+                    f"training.moe_aux_loss_coeff={tcfg.moe_aux_loss_coeff!r} is "
+                    "not applied on backend='unsloth': that setup never applies "
+                    "the MoE auxiliary loss. Remove it, or train with backend: transformers."
+                )
+        if tcfg.stream_layers:
+            # #1412: layer streaming setup never sets the router coefficient.
+            if tcfg.moe_aux_loss_coeff != default_aux:
+                raise ValueError(
+                    f"training.moe_aux_loss_coeff={tcfg.moe_aux_loss_coeff!r} is "
+                    "not applied with training.stream_layers: that setup never "
+                    "applies the MoE auxiliary loss. Remove it, or train without stream_layers."
                 )
         return self
 
