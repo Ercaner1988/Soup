@@ -37,7 +37,7 @@
 - [Standalone Sweep Config](#standalone-sweep-config)
 - [Alternative Model Hubs (ModelScope / Modelers)](#alternative-model-hubs-modelscope--modelers)
 - [Experiment Trackers (MLflow / SwanLab / Trackio)](#experiment-trackers-mlflow--swanlab--trackio)
-- [Telemetry (opt-IN, hardware-info-only)](#telemetry-opt-in-hardware-info-only)
+- [Telemetry (opt-in)](#telemetry-opt-in)
 - [Plugin System](#plugin-system)
 - [External Integrations Catalog](#external-integrations-catalog)
 - [Advanced Trainer Plugins](#advanced-trainer-plugins)
@@ -115,7 +115,7 @@ training:
     alpha: 32
 ```
 
-MLX backend supports SFT. `backend: mlx` with `task: dpo` or `task: grpo` is refused when the config is loaded, with an error naming the task — upstream `mlx-lm` ships no DPO/GRPO training helper, so those wrappers exist only as a backstop for callers that bypass config validation. Requires `mlx-lm >= 0.31.3`. Use `soup recipes search --tag mlx` for ready-made Apple Silicon configs.
+MLX backend supports SFT. `backend: mlx` with `task: dpo` or `task: grpo` is refused when the config is loaded, with an error naming the task — upstream `mlx-lm` ships no DPO/GRPO training helper, so those wrappers exist only as a backstop for callers that bypass config validation. Requires `mlx-lm >= 0.31.3`. Use `soup recipes search mlx` for ready-made Apple Silicon configs.
 
 #### Optimizers and schedules
 
@@ -197,9 +197,9 @@ training:
     alpha: 16
 ```
 
-Works with the tasks that have an unsloth setup: SFT (text; SFT vision and audio still run the transformers setup), DPO, GRPO, PPO, KTO, ORPO, SimPO, IPO, BCO, preference, Pretrain, Embedding and TTS. The others (`reward_model`, `prm`, `classifier`, `reranker`, `cross_encoder`, `distill`, `unlearn`, `moe_lora_routing`, `online_dpo` and `asr`) have no unsloth setup, so `backend: unsloth` is refused at config load for them (#1357). If unsloth is installed but not enabled, Soup will suggest it automatically.
+Works with the tasks that have an unsloth setup: SFT (text; SFT vision and audio still run the transformers setup), DPO, GRPO, PPO, KTO, ORPO, SimPO, IPO, BCO, preference, Pretrain, Embedding and TTS. The others (`reward_model`, `prm`, `classifier`, `reranker`, `cross_encoder`, `distill`, `unlearn`, `moe_lora_routing`, `online_dpo` and `asr`) have no unsloth setup, so `backend: unsloth` is refused at config load for them (#1357). If unsloth is installed but not enabled, Soup suggests it, but only for a config that would still load with `backend: unsloth` (#1736): a config one of these refusals would stop gets no suggestion.
 
-> **Tip:** Soup auto-detects unsloth. When installed, you'll see a hint during `soup train` if you haven't enabled it yet.
+> **Tip:** Soup auto-detects unsloth. When it is installed, `soup train` prints a hint if you haven't enabled it yet and your config would load with it.
 
 
 ## Cloud GPU Training
@@ -247,7 +247,11 @@ until it reports that termination succeeded; shutting down the guest does not te
 Pressing Ctrl+C during `--cloud-submit` interrupts the controller, which still runs that `finally`
 block, and `soup` waits for it to terminate the instance and exit rather than killing it; the only
 way to skip that cleanup is to kill the controller process itself (for example with `kill` from
-another terminal), which can leave the instance running.
+another terminal), which can leave the instance running. If remote training fails with a non-zero exit
+code, the controller fetches the last 50 lines of `/home/ubuntu/soup/train.log` over SSH (capped at 50 KB
+and sanitized of terminal control sequences) and prints them before terminating the instance so
+the root cause is immediately visible (the log file holds only `soup train` output; an earlier failure
+during cloud-init or `pip install` is not captured in it).
 
 Register the public half of an SSH key with Lambda first, then set:
 
@@ -377,7 +381,7 @@ LLM training generates massive checkpoint files. Soup automatically manages an S
 
 ```bash
 # List all historical training runs
-soup runs list
+soup runs
 
 # Compare two differing experiments side-by-side
 soup runs compare run_202611... run_202612...
@@ -556,6 +560,14 @@ soup doctor [--nccl]
 
 Shows: Python version, GPU availability, system resources (RAM/Disk), all dependency versions, and fix suggestions. Use `--nccl` to measure and check multi-GPU communication bandwidth against expected hardware ceilings.
 
+With `soup doctor --config soup.yaml`, the declared support report lists only
+explicitly written, active settings that differ from their schema defaults.
+Writing a default counts as leaving it unwritten, so a full YAML dump and its
+minimal source have the same report; `seed: 0` still counts because the seed
+default is unset. Settings refused at config load are not listed as doctor rows:
+their active values fail before the report can run. This report describes the
+reviewed gaps, not a guarantee that every unlisted setting is supported.
+
 ### GPU diagnostics
 
 When an NVIDIA GPU is available, `soup doctor` reports its compute capability
@@ -596,7 +608,7 @@ Soup shows friendly error messages by default (2-3 lines with a fix suggestion).
 soup --verbose train --config soup.yaml
 
 # Works with any command
-soup --verbose eval --model ./output --benchmarks mmlu
+soup --verbose eval benchmark --model ./output --benchmarks mmlu
 ```
 
 > **Note:** `--verbose` is a global flag — it must go **before** the command name, not after.
@@ -652,6 +664,10 @@ The whole sweep is refused before the first arm starts, and the command exits no
 a scripted or CI-driven sweep fails rather than reporting a grid of arms that each failed
 for the same reason. A sweep whose swept knob is never applied produces arms that are all
 identical, so there is no partially-useful result to preserve by continuing.
+
+**Size limits.** A config file may be at most 1 MiB, nest mappings and lists at most 100 levels,
+and expand through anchors, aliases and `<<` merge keys to at most one node per byte plus 10,000.
+A file over a limit is refused with a message naming the file and the limit (`soup ship`: 4 MiB).
 
 
 ## Experiment Tracking
@@ -724,7 +740,7 @@ zero telemetry network requests.
 You can also explicitly disable telemetry for a specific invocation using the `--no-telemetry` flag:
 
 ```bash
-soup train --config soup.yaml --no-telemetry
+soup --no-telemetry train --config soup.yaml
 ```
 
 When enabled, telemetry performs a synchronous fire-and-forget HTTP POST with a 1-second connect and read timeout (DNS resolution excluded) on command exit. The anonymous identifier is stored at `~/.soup/telemetry_id`; deleting `~/.soup/telemetry_id` regenerates it on the next opt-in. See [Privacy Policy](#privacy-policy) for details.
@@ -1174,6 +1190,8 @@ When it doesn't fit, the report names actionable knobs: `--batch-size halve`, `-
 
 The weights bucket assumes 2 bytes/param under `quant="none"` (a frozen base now really does load at the checkpoint's own dtype, typically bf16/fp16 — #339), except `peft="full"` (full fine-tuning), which explicitly loads fp32 master weights and so assumes 4 bytes/param instead.
 
+`mxfp4` and `fp8` are dequantized on load, so they take the same 2 bytes/param. `gptq`, `awq`, `aqlm` and `eetq` stay packed and are priced at their own figures. `soup train` has no figure for `hqq:*` and says it skipped the check ([Quant Menu](performance-and-quantization.md#quant-menu--9-quantization-formats)).
+
 
 ## Shell Completions (`soup completions`)
 
@@ -1191,7 +1209,7 @@ soup completions zsh > "${fpath[1]}/_soup"
 soup completions fish > ~/.config/fish/completions/soup.fish
 ```
 
-Recipe names auto-complete from the 115+ catalogue; `--target-modules` falls back to canonical Llama-shape defaults (`q_proj` / `k_proj` / `v_proj` / etc.). Live HF-config introspection per `base` lands in v0.64.1.
+Command names and option names complete, straight from the live command tree: `rec` + Tab gives `recipes`, and after `soup train`, `--res` + Tab gives `--resume`. Values do not complete yet — recipe names after `soup recipes show`, for instance — because no option or argument is wired to a value completer. Two are ready for that wiring in `soup_cli/utils/completions.py`: `complete_recipe_name`, and `complete_target_modules`, which since v0.71.1 looks the base model's architecture up in its Hugging Face config when that config is already in the local cache (config only, never a download) and offers that architecture's module names, falling back to the canonical Llama-shape defaults (`q_proj` / `k_proj` / `v_proj` / etc.).
 
 
 ## License Advisor (`soup license-advisor`)

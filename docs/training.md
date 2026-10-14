@@ -7,7 +7,10 @@
 > **Training a model bigger than your GPU?** `training.stream_layers: true` streams the
 > frozen base from CPU RAM (with NVMe disk overflow) one decoder layer at a time, so peak
 > VRAM is bounded by one layer instead of the whole model. Add `quantization: 4bit` and an
-> 8B base fits a 4 GB card. Works for `sft` and, from v0.72.4, for `dpo` / `orpo` /
+> 8B base fits a 4 GB card at batch 1 and 512 tokens per step; on a 128k-vocabulary model
+> every further 512 tokens costs about 1 GB more (see
+> [Sizing a streaming run](performance-and-quantization.md#sizing-a-streaming-run-v0723)).
+> Works for `sft` and, from v0.72.4, for `dpo` / `orpo` /
 > `simpo` / `kto` — DPO's reference model is the same streamed base with its adapters
 > switched off, so it needs no second copy of the model (on an untied checkpoint `dpo` and
 > `kto` still hold one copy of the output head per step) — see
@@ -92,12 +95,18 @@ they do not evaluate by default, and they do not withhold rows either:
 `data.val_split` is ignored, every row trains, and the run prints a one-line note
 saying so. On `grpo`, set `training.eval_steps` to hold the split out and
 evaluate it; TRL generates completions for the held-out prompts and logs
-`eval_loss` with the evaluation rewards. On `grpo` that `eval_loss` (the Val
-loss row and the tracker's `val_loss`) is TRL's policy objective on the
-held-out completions, not a likelihood: advantages are normalised within each
-group, so it stays near zero, can be negative, and does not measure held-out
-quality. The held-out reward is `eval_reward`, in the `log_history` of each
-checkpoint's `trainer_state.json`. TRL needs whole groups of
+`eval_loss` with the evaluation rewards. On `grpo` the run's validation number
+is the held-out reward, `eval_reward` (the mean reward over the held-out
+completions, higher is better): the live panel shows it as `Val reward`, the
+tracker stores it in the `val_reward` column of the metrics table, and the
+training event stream carries it as `val_reward` (#1389). TRL's `eval_loss` on
+`grpo` is its policy objective at importance ratio 1, not a likelihood:
+advantages are normalised within each group, so it stays near zero, can be
+negative, and does not measure held-out quality. It is not recorded or shown as
+a loss: a `grpo` run's `val_loss` series is empty, and `Val loss` does not
+appear. The per-task choice lives in `VALIDATION_METRICS` in
+`utils/eval_schedule.py`; every other task records `eval_loss` as `val_loss`.
+TRL needs whole groups of
 `num_generations` completions in an evaluation batch, so `grpo` evaluates at the
 largest multiple of `num_generations` that fits in the train batch, and says so
 when that differs from the train batch. The evaluation's rewards never reach the
@@ -502,6 +511,22 @@ whitespace tokens to the active tokenizer's integer ids. This catches subword
 repetition that punctuation-heavy decoded text can hide, but the score becomes
 tokenizer-specific rather than vocabulary-agnostic.
 
+The `info_rm` detector stays silent on any step whose median split leaves
+either half constant — a two-valued reward (e.g. `reward_fn: accuracy`'s 0/1)
+always does, and so does a continuous reward where half the batch lands on
+the same value (e.g. rewards clipped at 0). The separation index there would
+measure the success rate rather than reward-model health, so the step casts
+no vote: no baseline is recorded and nothing halts or mutates β (one warning
+is logged per run). The single exception: once a baseline exists, a step
+where *every* reward is identical still votes 0.0 — a 0/1 run never records
+a baseline and stays silent, while a genuinely collapsed continuous reward
+reads HACK as before. For two-valued rewards use
+`reward_hack_detector: rm_ensemble` or the length/repetition signals instead.
+**Changed:** before this version a constant-half split could record an
+inflated separation (~3×10⁴ at a 50% first step) as the baseline and classify
+later, healthier steps as HACK — detector logs and `mitigation_log.jsonl`
+files from runs before this version are not comparable.
+
 ### Closed-loop reward-hacking auto-mitigation (v0.71.26)
 
 The detectors above *halt*; `training.reward_hack_mitigation` (or the `--reward-hack-mitigation` flag) makes the trainer *self-correct* mid-run. It requires `reward_hack_detector` on a `grpo` transformers run, and has four modes:
@@ -852,7 +877,10 @@ weights would round most updates away at these learning rates (#1235).
 
 Use a trained PRM as the **per-step reward** inside GRPO — the o1-era
 process-supervision signal. Set `training.prm_reward` to a PRM directory (a
-`task=prm` checkpoint) or HF id; the PRM splits each generated completion into
+`task=prm` checkpoint) or a Hub id, `org/name` or `org/name@revision`; a Hub id is
+downloaded (weights, tokenizer and custom-code files) when the reward is built,
+before training, and a repo that is not a Soup-trained PRM (no reward head) is
+refused there, naming the configured value (#1466). The PRM splits each generated completion into
 reasoning steps (newline heuristic), scores every step with its reward head, and
 folds the per-step scores into one scalar reward that GRPO optimises. It
 **replaces** `reward_fn` and rides the existing reward-shaping +
@@ -961,15 +989,16 @@ training:
 
 The combine wrapper computes a weighted sum via the in-tree
 `compute_dpo_term` / `compute_simpo_term` / `compute_orpo_term` /
-`compute_ipo_term` kernels. On trl 0.29 it reads the per-sequence log-probs
-those kernels need out of the primary trainer's own forward pass
-(`concatenated_forward`), so which blends train depends on which trainer is
-built:
+`compute_ipo_term` kernels. The loss with the largest weight is the *primary*:
+its trl trainer is the one that is built, and on trl 0.29 the per-sequence
+log-probs the kernels need are read out of that trainer's own forward pass.
+Where they come from depends on which trainer is built:
 
 | Blend | Result on trl 0.29 |
 | --- | --- |
-| `simpo` + `orpo` | Trains. The CPO (SimPO) and ORPO trainers both return their per-sequence log-probs. |
-| anything naming `dpo` or `ipo` | Stops at the first step and names the terms. They need a frozen reference model this path does not build, so there are no reference log-probs to read — and their own trainers compute log-probs inline, publishing only means. |
+| `simpo` + `orpo` | Trains. The CPO (SimPO) and ORPO trainers both return their per-sequence log-probs (`concatenated_forward`). |
+| `dpo` or `ipo` has the largest weight, with any of `dpo`, `ipo`, `simpo`, `orpo` beside it | Trains. Both build trl's `DPOTrainer`: the policy log-probs are taken from the logits of its own forward pass, the reference log-probs from its `compute_ref_log_probs`. |
+| `simpo` or `orpo` has the largest weight, and the blend names `dpo` or `ipo` | Trains. The CPO / ORPO trainers run no reference, so the blend runs one: the same forward once more, without gradients and with the LoRA adapter switched off. Refused with `init_strategy: pissa` / `olora` / `loftq` or `relora_steps`, where that is not the starting model ("Which reference" below). |
 | `bco` mixed with anything | Rejected at config load (data format incompatible). |
 
 **What a term is.** In a blend, `simpo` and `orpo` are their *preference terms
@@ -981,10 +1010,56 @@ simpo` run, and `training.cpo_alpha` does not affect it. Use
 does honour its own config field: `training.simpo_gamma` for SimPO,
 `training.orpo_beta` for ORPO, whichever loss has the larger weight or not.
 
-**Evaluation.** With `val_split` set, trl's `prediction_step` calls
-`get_batch_loss_metrics` directly, so the eval loss is the primary loss's own
-trl loss — not the blend's value. Training and evaluation therefore report
-different numbers for the same batch.
+The `dpo` and `ipo` terms are the losses `preference_loss: dpo` and
+`preference_loss: ipo` train: DPO's sigmoid loss with `training.dpo_beta`, and
+IPO's squared loss with `training.ipo_tau`, where each side's log-ratio is
+divided by its response length, as trl does. They read those two fields
+whichever of them is the primary, so `{dpo: 0.5, ipo: 0.5}` and
+`{ipo: 0.5, dpo: 0.5}` are the same loss. `dpo_beta_schedule` is not available
+with a blend.
+
+**Which reference.** Under a `dpo` / `ipo` primary it is trl's: the frozen
+`ref` adapter, a copy of the adapter as it started. Under a `simpo` / `orpo`
+primary it is the base model with the adapter switched off. For a new LoRA
+adapter, whose update starts at zero, the two compute the same thing.
+
+That holds while the base weights are the ones that were loaded, which covers
+the default init (`init_strategy: random`), DoRA and rsLoRA.
+`init_strategy: pissa`, `olora` and `loftq` (and `use_olora`) move part of
+every targeted weight into the adapter and leave a residual in the base, and
+`relora_steps` merges the adapter into the base at every restart; with the
+adapter off the model is then no longer the one the policy started from. A
+`dpo` / `ipo` term under a `simpo` / `orpo` primary is refused with either of
+them, before the model is loaded. With such an init, give `dpo` or `ipo` the
+largest weight: trl's copy of the adapter carries the residual's other half,
+so its reference is still the starting model.
+
+**Which tokens.** The terms are computed on the primary trainer's batch, and
+the two trainer families do not render a row the same way: the CPO / ORPO
+batches start with the tokenizer's BOS token, and the `DPOTrainer`'s need not
+(with a plain tokenizer and no chat template they do not). An even split
+between a reference loss and a reference-free one therefore depends on which
+key comes first, because the first key is the primary.
+
+**Cost.** The policy is run once per step, as in a single-loss run. A `dpo` /
+`ipo` primary runs the reference twice: trl computes its own reference
+log-probs inline and keeps only their means, so the blend asks the trainer for
+them again (`compute_ref_log_probs`, without gradients). A `simpo` / `orpo`
+primary runs the reference once, and only when the blend names `dpo` or `ipo`;
+with `val_split` it runs on evaluation batches too.
+
+With 16-bit logits (bf16 or fp16 autocast) a `dpo` / `ipo` primary also keeps
+one more tensor the size of the logits for the backward pass, next to the one
+trl's own loss keeps: 2 bytes × rows × tokens × vocabulary, where a batch of 4
+pairs is 8 rows. That is about 250 MiB for 4 pairs of 512 tokens and a
+32,000-token vocabulary. With float32 logits it keeps none.
+
+**Evaluation.** With `val_split` set and a `simpo` / `orpo` primary, trl's
+`prediction_step` calls `get_batch_loss_metrics` directly, so the eval loss is
+the primary loss's own trl loss — not the blend's value. Training and
+evaluation therefore report different numbers for the same batch. With a `dpo`
+/ `ipo` primary, trl's `prediction_step` goes through `compute_loss`, so the
+eval loss is the blend's value.
 
 
 ## MoE Model Support
@@ -1060,8 +1135,11 @@ A relative `image` path resolves against `data.image_dir`, or against the data f
 directory when it is unset. A Hub dataset or a remote URI has no data file directory, so set
 `data.image_dir` when its rows hold image paths; see
 [Data Pipeline Pro](data.md#data-pipeline-pro).
+Decoded in-memory PIL images (such as from a Hugging Face Hub `Image()` column) and Parquet
+image structs (`{"bytes": ..., "path": ...}`) written by `datasets` are also accepted; a struct's
+`path` follows the same directory resolution and path containment rules as a plain path string.
 
-`soup data inspect` automatically shows image statistics (count, formats, missing files) for vision datasets.
+`soup data inspect` resolves image paths the same way, or uses `--image-dir` when provided, and automatically shows image statistics (count, formats, missing files) for vision datasets.
 
 
 ## Audio / Speech Fine-tuning
@@ -1235,6 +1313,13 @@ training:
   quantization: 4bit
 ```
 
+A base published as a vision-language wrapper (MiniMax-M3, `model_type: minimax_m3_vl`) is not
+registered under `AutoModelForCausalLM`, so a plain DPO config cannot load it. Set `modality: vision`
+and DPO loads it the way SFT's vision path does, through `AutoModelForImageTextToText` with the
+model's processor, and trains the language tower; the LoRA targets resolve to that tower as before.
+Preference rows carry no images, and `soup recipes verify` builds the same class the trainer loads.
+`backend: unsloth` does not read `modality` for DPO and is refused at config load for it (#1393).
+
 
 ## Preference Variety — BCO + Unified Dispatcher + KL Variants
 
@@ -1286,7 +1371,18 @@ training:
   dpo_beta_end: 0.01
 ```
 
-Gated to DPO-family tasks (`dpo`, `ipo`, or `preference` with `preference_loss in {dpo, ipo}`); transformers backend only. `dpo_ref_regen_epochs` is refused at config load: it never regenerated the reference. With LoRA there is no separate reference model to copy into, and the DPO-family trainers cannot run with `lora.r: 0`. The wiring is tracked in [#1345](https://github.com/MakazhanAlpamys/Soup/issues/1345).
+Gated to DPO-family tasks (`dpo`, `ipo`, or `preference` with `preference_loss in {dpo, ipo}`); transformers backend only.
+
+Periodically sync the frozen reference model with the active student using `dpo_ref_regen_epochs`:
+
+```yaml
+training:
+  epochs: 4
+  dpo_beta: 0.1
+  dpo_ref_regen_epochs: 2  # copies .default. adapter weights into .ref. every 2 epochs
+```
+
+With LoRA, TRL creates a frozen `.ref.` adapter on the model. On every Nth epoch (1-indexed, skipping epoch 0), parameters from the active `.default.` adapter are copied into the frozen `.ref.` adapter under `torch.no_grad()`. Requires LoRA (`lora.r >= 1`); full fine-tuning (`lora.r: 0`) is refused at config load (#1345).
 
 ### Multi-objective preference loss
 
@@ -1297,9 +1393,9 @@ training:
 ```
 
 Schema validates 2–5 entries summing to 1, and rejects `bco` mixed with a
-paired loss at config load. On trl 0.29 a `simpo` + `orpo` blend trains; any
-blend naming `dpo` or `ipo` stops at the first step naming the terms it could
-not compute, because those trainers publish no per-sequence log-probs to read
+paired loss at config load. On trl 0.29 every blend of `dpo`, `ipo`, `simpo`
+and `orpo` trains; which reference and which tokens the terms use depends on
+the loss with the largest weight
 (see [Weighted Multi-Objective Preference Loss](#weighted-multi-objective-preference-loss)).
 Set `training.preference_loss` for a single loss.
 
@@ -1900,7 +1996,9 @@ training:
 
 Operator-supplied `data.new_special_tokens` are registered (deduplicated, only
 tokens not already in the vocab) and the embedding matrix is resized through the
-(possibly PEFT-wrapped) model so the codec-token ids have rows. Orpheus + Oute
+(possibly PEFT-wrapped) model so the codec-token ids have rows. That happens on
+`backend: transformers` only: the unsloth setup has no step that adds tokens, so
+`backend: unsloth` with `new_special_tokens` is refused at load (#1358). Orpheus + Oute
 support emotion conditioning via `training.tts_emotion` from a per-family
 allowlist (Orpheus: neutral / happy / sad / angry / excited / calm / whisper /
 laugh; Oute: neutral / happy / sad / angry / calm / excited) — the wrapper
@@ -2034,16 +2132,25 @@ training:
   # block. capacity_factor is the fraction of tokens that get the residual update.
   use_mod: true
   mod_capacity_factor: 0.125
-
-  # LLaMA Pro: append zero-initialised identity decoder blocks and train only the new
-  # ones (freeze_trainable_layers must equal expand_layers and freezes the
-  # originals). Needs quantization: none.
-  expand_layers: 4
-  freeze_trainable_layers: 4
 ```
 
-`use_mod` / `expand_layers` attach AFTER `get_peft_model` so the new routers / blocks are
-trainable. Unsupported architectures warn + skip. Pick one of MoD / LLaMA Pro per run. (v0.71.12)
+```yaml
+training:
+  # LLaMA Pro: append zero-initialised identity decoder blocks and train only the new
+  # ones (freeze_trainable_layers must equal expand_layers and freezes the
+  # originals). Needs quantization: none and lora.r: 0 (task: sft).
+  expand_layers: 4
+  freeze_trainable_layers: 4
+  quantization: none
+  lora:
+    r: 0
+```
+
+`use_mod` attaches AFTER `get_peft_model`, so the new routers are trainable. `expand_layers`
+runs BEFORE it, and `get_peft_model` would freeze the appended blocks again, so a LoRA rank is
+refused with `expand_layers` and the blocks train with `lora.r: 0`
+([#1326](https://github.com/MakazhanAlpamys/Soup/issues/1326)). Unsupported architectures
+warn + skip. Pick one of MoD / LLaMA Pro per run. (v0.71.12)
 
 LongLoRA S² (`use_longlora: true`) is refused at config load
 ([#1240](https://github.com/MakazhanAlpamys/Soup/issues/1240)). Its override rolled the
