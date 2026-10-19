@@ -1,4 +1,4 @@
-<!-- synced-from: README.md sha256:adcd1f2b7de834b9a4fd1d5acf17b5a15ef8f6c08e58e1efa62d152eb0b4fdb4 -->
+<!-- synced-from: README.md sha256:f4beaf4fb00428833a8f4a6541981266464c7b2b301c4ee492276477b27f7727 -->
 <p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <a href="README.zh.md">中文</a> | <strong>Русский</strong></p>
 
 <p align="center">
@@ -288,7 +288,7 @@ ASR, обычный текст, эмбеддинги, RAFT и другие — �
 TXT, поэтому в большинстве случаев достаточно указать в `data.train` путь к файлу, и больше ничего менять не нужно. Схемы с
 готовым примером для каждого формата, а также конвейер данных (удалённые URI, потоковая обработка, шардирование,
 чередование, расширение словаря, приём документов) описаны в
-[`docs/data.md`](docs/data.md#data-formats).
+[`docs/data.md`](docs/data.md#data-formats); нативное обучение аудио Sesame CSM описано отдельно в [документации по обучению](docs/training.md#native-sesame-csm).
 
 ## Часто используемые команды
 
@@ -485,4 +485,4 @@ Apple Silicon, — до которых одному ноутбуку с 4 GB н�
 
 ## Лицензия
 
-[Apache-2.0](LICENSE). Copyright © участники проекта Soup.
+[Apache-2.0](LICENSE). Copyright 2026 Makazhan Alpamys и участники проекта Soup. При распространении Soup или его изменённой копии применяются разделы 4 и 6 лицензии: сохраняйте файлы `LICENSE` и `NOTICE` в каждой копии, отмечайте изменённые файлы и не используйте название Soup иначе как для указания происхождения работы.

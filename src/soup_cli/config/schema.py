@@ -1142,7 +1142,15 @@ class TrainingConfig(BaseModel):
             "static on CPU). Default 'auto' (v0.36.0)."
         ),
     )
-    gradient_accumulation_steps: int = Field(default=4, ge=1)
+    gradient_accumulation_steps: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Number of micro-batches whose gradients are summed before each optimizer "
+            "update. Effective batch size per device is batch_size * "
+            "gradient_accumulation_steps (times the number of GPUs)."
+        ),
+    )
     # #341 — the general training seed. Before this there was none:
     # `TrainingArguments` took HF's defaults on every run, so two runs of the
     # same config differed only by GPU nondeterminism and "run it again with a
@@ -1187,10 +1195,32 @@ class TrainingConfig(BaseModel):
             )
         return v
 
-    warmup_ratio: float = Field(default=0.03, ge=0.0, le=0.5)
-    weight_decay: float = Field(default=0.01, ge=0.0)
-    max_grad_norm: float = Field(default=1.0, gt=0)
-    lora: LoraConfig = Field(default_factory=LoraConfig)
+    warmup_ratio: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "Fraction of total training optimizer steps used for linear learning "
+            "rate warmup. Resolved over real optimizer steps."
+        ),
+    )
+    weight_decay: float = Field(
+        default=0.01,
+        ge=0.0,
+        description=(
+            "Weight decay factor (decoupled, AdamW-style) applied to weights "
+            "during optimization; 0 disables it."
+        ),
+    )
+    max_grad_norm: float = Field(
+        default=1.0,
+        gt=0,
+        description="Maximum gradient norm for gradient clipping.",
+    )
+    lora: LoraConfig = Field(
+        default_factory=LoraConfig,
+        description="LoRA (Low-Rank Adaptation) adapter architecture and target modules.",
+    )
     quantization: Literal[
         "4bit",
         "8bit",
@@ -1821,10 +1851,9 @@ class TrainingConfig(BaseModel):
     ]] = Field(
         default=None,
         description=(
-            "TTS model family — required when task='tts'. Runnable choices are "
-            "orpheus, llasa, spark, and oute. sesame_csm is retained only so "
-            "legacy configs receive an explicit refusal until Soup has a native "
-            "CSM multimodal trainer."
+            "TTS model family — required when task='tts'. "
+            "orpheus, llasa, spark and oute use codec-string SFT; sesame_csm uses "
+            "a native multimodal trainer with raw audio and 32 parallel Mimi codebooks."
         ),
     )
     tts_emotion: Optional[str] = Field(
@@ -3024,6 +3053,18 @@ class TrainingConfig(BaseModel):
         default=False,
         description="Enable Liger Kernel fused operations (20-60% memory savings, 20-40% speedup)",
     )
+    # #792 — the Fast-LoRA kernels (utils/fast_lora*.py) behind one switch
+    fast_lora: bool = Field(
+        default=False,
+        description=(
+            "Run LoRA's q/k/v, MLP and other projections through Soup's "
+            "hand-written Fast-LoRA autograd functions instead of peft's "
+            "modules. Same math; no speedup is claimed. task='sft' on the "
+            "transformers backend with text, quantization none or 4bit, and "
+            "lora.dropout 0; refused beside use_liger, DoRA, VeRA, "
+            "target_parameters, Spectrum, LISA and FP8 training."
+        ),
+    )
     # Performance — FlashAttention
     use_flash_attn: bool = Field(
         default=False,
@@ -3263,7 +3304,7 @@ class TrainingConfig(BaseModel):
         default=False,
         description=(
             "On watchdog trigger: write <output>/spike_recovery.json with "
-            "decayed LR and attempt count for re-launch (instead of bare stop). "
+            "decayed LR and attempt count for re-launch (tracks attempts and caps recovery). "
             "Requires loss_watchdog=true."
         ),
     )
@@ -4959,8 +5000,13 @@ class SoupConfig(BaseModel):
             "CUDA), or mlx (Apple Silicon M1-M4)"
         ),
     )
-    data: DataConfig
-    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    data: DataConfig = Field(
+        description="Dataset source, format, tokenization, and preprocessing settings."
+    )
+    training: TrainingConfig = Field(
+        default_factory=TrainingConfig,
+        description="Training hyperparameters, optimizer, scheduler, and hardware settings.",
+    )
     output: str = Field(default="./output", description="Output directory for trained model")
     experiment_name: Optional[str] = Field(default=None, description="Experiment name for tracking")
     eval: Optional[EvalConfig] = Field(
@@ -5799,17 +5845,12 @@ class SoupConfig(BaseModel):
             if tcfg.tts_family is None:
                 raise ValueError(
                     "task='tts' requires a runnable training.tts_family in "
-                    "(orpheus, llasa, spark, oute); sesame_csm is currently refused"
+                    "(orpheus, llasa, sesame_csm, spark, oute)"
                 )
             if tcfg.tts_family == "sesame_csm":
-                raise ValueError(
-                    "training.tts_family='sesame_csm' is not supported by Soup yet: "
-                    "CSM trains text plus 32 Mimi codebooks as parallel multimodal "
-                    "frames, so neither raw data.format='audio' nor pre-encoded "
-                    "data.format='chatml' is a valid text-SFT substitute. Use the "
-                    "model's native CSM/AutoProcessor training path until Soup has "
-                    "a dedicated CSM trainer."
-                )
+                from soup_cli.utils.csm import validate_csm_config
+
+                validate_csm_config(self)
             if self.data.format == "audio" and tcfg.tts_family in {"spark", "oute"}:
                 from soup_cli.utils.tts_codec import incompatible_live_codec_error
 
@@ -5937,6 +5978,13 @@ class SoupConfig(BaseModel):
                 )
             except ValueError as exc:
                 raise ValueError(str(exc)) from exc
+
+            if self.modality != "text":
+                raise ValueError(
+                    "task='distill' requires modality='text': the distill trainer "
+                    "loads a text-only student and teacher and does not process "
+                    f"vision or audio inputs; got modality={self.modality!r}."
+                )
 
             chunk_offenders = [
                 name
@@ -6070,6 +6118,75 @@ class SoupConfig(BaseModel):
                 f"training.train_on_eot=true requires task in "
                 f"{sorted(sft_family_tasks)}; got task={self.task!r}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fast_lora_supported(self) -> "SoupConfig":
+        """#792 — the first slice of ``training.fast_lora``. The kernels patch
+        peft's LoRA modules on a text model trained by the SFT wrapper; every
+        other setting is refused with its reason rather than left unpatched."""
+        tcfg = self.training
+        if not tcfg.fast_lora:
+            return self
+        lora = tcfg.lora
+        reason = None
+        if self.backend != "transformers":
+            reason = (
+                f"needs backend='transformers'; got backend={self.backend!r}. The "
+                f"kernels replace peft's LoRA modules, which that backend does not use."
+            )
+        elif self.modality != "text":
+            reason = f"supports modality='text' only; got modality={self.modality!r}."
+        elif self.task != "sft":
+            reason = (
+                f"supports task='sft' only; got task={self.task!r}. Other trainers "
+                f"are not tested with the kernels yet."
+            )
+        elif lora.r == 0:
+            reason = "needs a LoRA; lora.r=0 trains the full model, with no LoRA to patch."
+        elif tcfg.unfrozen_parameters or tcfg.lisa_enabled:
+            name = "unfrozen_parameters" if tcfg.unfrozen_parameters else "lisa_enabled"
+            reason = (
+                f"cannot be combined with training.{name}: that mode trains the "
+                f"model's own weights and skips the LoRA setup the kernels hook into."
+            )
+        elif tcfg.quantization_aware == "fp8":
+            # (QuEST needs lora.r=0, refused above.)
+            reason = (
+                "cannot be combined with training.quantization_aware='fp8': FP8 "
+                "training converts the projections, and the kernels read their "
+                "weights directly, around the conversion."
+            )
+        elif lora.use_dora or lora.use_vera:
+            name = "use_dora" if lora.use_dora else "use_vera"
+            reason = (
+                f"cannot be combined with lora.{name}: the kernels compute plain "
+                f"LoRA, not that adapter's update."
+            )
+        elif lora.target_parameters:
+            reason = (
+                "cannot be combined with lora.target_parameters: those adapters "
+                "wrap parameters, not the Linear modules the kernels patch."
+            )
+        elif tcfg.quantization not in ("none", "4bit"):
+            reason = (
+                f"supports quantization 'none' or '4bit'; got "
+                f"quantization={tcfg.quantization!r}."
+            )
+        elif lora.dropout != 0:
+            reason = (
+                f"needs lora.dropout: 0; got {lora.dropout} (Soup's default is 0.05). "
+                f"peft gives every projection its own dropout, so q/k/v and gate/up "
+                f"would no longer share the one input the kernels read."
+            )
+        elif tcfg.use_liger:
+            reason = (
+                "cannot be combined with training.use_liger: Liger already replaces "
+                "the MLP's forward, and fast_lora would replace it again. Keep one "
+                "of them."
+            )
+        if reason is not None:
+            raise ValueError(f"training.fast_lora {reason}")
         return self
 
     @model_validator(mode="after")
@@ -6834,6 +6951,13 @@ class SoupConfig(BaseModel):
                 f"initialise the adapter from an SVD of the base weight, which "
                 f"is on the meta device under streaming."
             )
+        if tcfg.use_cut_ce:
+            raise ValueError(
+                "training.stream_layers cannot be combined with training.use_cut_ce: "
+                "the streamed setup never installs the resident Cut Cross-Entropy patch. "
+                "Set use_cut_ce=false to stream with the conservative logits budget, "
+                "or disable stream_layers to use resident CCE."
+            )
         conflicts = []
         if tcfg.unfrozen_parameters:
             conflicts.append("unfrozen_parameters")
@@ -6867,8 +6991,8 @@ class SoupConfig(BaseModel):
         # set there either, so `use_liger_kernel` misses `TrainingArguments` as
         # well. These are the switches a user reaches for when a streamed run will
         # not fit, so silently dropping them is the worst outcome: refuse until
-        # each is wired and shown to engage on a streamed model. (`use_cut_ce` has
-        # the same shape and is #1206.)
+        # each is wired and shown to engage on a streamed model.
+        # CCE is refused separately above (#1206).
         if tcfg.use_liger:
             conflicts.append("use_liger")
         if tcfg.use_flash_attn:
@@ -7488,6 +7612,24 @@ class SoupConfig(BaseModel):
                 f"quantization={quant!r} is not supported on the mlx backend "
                 "(no equivalent kernels). Use backend='transformers' or "
                 "switch to quantization in {'4bit', '8bit', 'none'}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_unsloth_8bit(self) -> "SoupConfig":
+        """#1811 — ``quantization: 8bit`` on ``backend: unsloth`` loaded in 16-bit.
+
+        ``utils/unsloth.py`` passes ``load_in_4bit`` and nothing else, and the
+        declared floor (``unsloth>=2024.8``) has no ``load_in_8bit`` to pass, so
+        ``8bit`` loaded exactly like ``none`` with no word. Refuse it, naming the
+        two values the Unsloth path applies.
+        """
+        if self.backend == "unsloth" and self.training.quantization == "8bit":
+            raise ValueError(
+                "training.quantization: 8bit is not applied on backend: unsloth "
+                "(Soup's Unsloth loader passes load_in_4bit only, so 8bit loaded the model "
+                "in 16-bit). Use quantization: 4bit or none with backend: unsloth, or "
+                "backend: transformers for 8-bit."
             )
         return self
 
@@ -8446,6 +8588,18 @@ class SoupConfig(BaseModel):
         )
 
     @model_validator(mode="after")
+    def _validate_unsloth_sft_modality(self) -> "SoupConfig":
+        """#1186: multimodal SFT setup does not use the requested Unsloth backend."""
+        if self.task == "sft" and self.backend == "unsloth" and self.modality != "text":
+            raise ValueError(
+                "task='sft' with backend='unsloth' requires modality='text': "
+                "the vision and audio setup paths load through transformers and "
+                f"do not use Unsloth; got modality={self.modality!r}. "
+                "Use backend: transformers for multimodal SFT."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_unsloth_has_a_setup(self) -> "SoupConfig":
         """#1357 — ``backend: unsloth`` on a task outside
         :data:`UNSLOTH_SETUP_TASKS` was accepted and never applied: that trainer
@@ -8547,6 +8701,7 @@ training:
     alpha: 16
     target_modules: auto
   quantization: 4bit
+  gradient_checkpointing: true
   grpo_beta: 0.1
   num_generations: 4
   reward_fn: accuracy
@@ -8559,7 +8714,7 @@ output: ./output
 base: meta-llama/Llama-3.2-11B-Vision-Instruct
 task: sft
 modality: vision
-# backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
+backend: transformers  # The vision SFT path does not use Unsloth.
 
 data:
   train: ./data/vision_train.jsonl
@@ -8693,6 +8848,7 @@ training:
     alpha: 16
     target_modules: auto
   quantization: 4bit
+  gradient_checkpointing: true
   bco_beta: 0.1
 
 output: ./output
@@ -8754,6 +8910,7 @@ training:
     alpha: 16
     target_modules: auto
   quantization: 4bit
+  gradient_checkpointing: true
   ipo_tau: 0.1
 
 output: ./output
@@ -8904,7 +9061,7 @@ output: ./output_embedding
 base: Qwen/Qwen2-Audio-7B-Instruct
 task: sft
 modality: audio
-# backend: unsloth  # 2-5x faster, pip install "soup-cli[fast]"
+backend: transformers  # The audio SFT path does not use Unsloth.
 
 data:
   train: ./data/audio_train.jsonl

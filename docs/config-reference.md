@@ -47,8 +47,8 @@ Sections:
 | `task` | `str` | `"sft"` | one of `"sft"`, `"dpo"`, `"grpo"`, `"ppo"`, `"reward_model"`, `"kto"`, `"orpo"`, `"simpo"`, `"ipo"`, `"bco"`, `"preference"`, `"pretrain"`, `"embedding"`, `"prm"`, `"tts"`, `"classifier"`, `"reranker"`, `"cross_encoder"`, `"distill"`, `"unlearn"`, `"moe_lora_routing"`, `"online_dpo"`, `"asr"` | Training task type. v0.50.0 added 'prm'; v0.52.0 adds 'tts' (TTS fine-tuning), 'classifier' / 'reranker' / 'cross_encoder' (classification heads), and 'distill' (knowledge distillation). v0.61.0 adds 'unlearn' (NPO / SimNPO / RMU). v0.67.0 adds 'moe_lora_routing' (per-token gating over N task LoRAs). |
 | `modality` | `str` | `"text"` | one of `"text"`, `"vision"`, `"audio"`, `"audio_out"` | Training modality: text (default), vision (multimodal), audio (audio-input), or audio_out (audio-output — paired with task='tts', v0.52.0). |
 | `backend` | `str` | `"transformers"` | one of `"transformers"`, `"unsloth"`, `"mlx"` | Training backend: transformers (default), unsloth (2-5x faster on CUDA), or mlx (Apple Silicon M1-M4) |
-| `data` | `section` | **required** |  | See [`data`](#data). |
-| `training` | `section` | section defaults |  | See [`training`](#training). |
+| `data` | `section` | **required** |  | Dataset source, format, tokenization, and preprocessing settings. See [`data`](#data). |
+| `training` | `section` | section defaults |  | Training hyperparameters, optimizer, scheduler, and hardware settings. See [`training`](#training). |
 | `output` | `str` | `"./output"` |  | Output directory for trained model |
 | `experiment_name` | `str \| null` | `null` |  | Experiment name for tracking |
 | `eval` | `section \| null` | `null` |  | Evaluation configuration for auto-eval after training. See [`eval`](#eval). |
@@ -105,13 +105,13 @@ Sections:
 | `training.lr` | `float` | `2e-05` | `> 0` | Learning rate |
 | `training.batch_size` | `int \| "auto"` | `"auto"` |  | Batch size. 'auto' = find max that fits in memory. |
 | `training.auto_batch_size_strategy` | `str` | `"auto"` | one of `"auto"`, `"static"`, `"probe"` | How to pick the auto batch size: 'static' (fast formula), 'probe' (real OOM try/halve loop), 'auto' (probe on CUDA, static on CPU). Default 'auto' (v0.36.0). |
-| `training.gradient_accumulation_steps` | `int` | `4` | `>= 1` |  |
+| `training.gradient_accumulation_steps` | `int` | `4` | `>= 1` | Number of micro-batches whose gradients are summed before each optimizer update. Effective batch size per device is batch_size \* gradient_accumulation_steps (times the number of GPUs). |
 | `training.seed` | `int \| null` | `null` | `>= 0`, `<= 4294967295` | Training seed (weight init of new params, data order, dropout). Reaches TrainingArguments.seed and the multipack sampler. Unset = HF's default of 42. |
 | `training.data_seed` | `int \| null` | `null` | `>= 0`, `<= 4294967295` | Separate seed for data sampling only (TrainingArguments.data_seed). Set it alongside `seed` to vary data order while holding initialisation fixed. Unset = follow `seed`. |
-| `training.warmup_ratio` | `float` | `0.03` | `>= 0.0`, `<= 0.5` |  |
-| `training.weight_decay` | `float` | `0.01` | `>= 0.0` |  |
-| `training.max_grad_norm` | `float` | `1.0` | `> 0` |  |
-| `training.lora` | `section` | section defaults |  | See [`training.lora`](#traininglora). |
+| `training.warmup_ratio` | `float` | `0.03` | `>= 0.0`, `<= 0.5` | Fraction of total training optimizer steps used for linear learning rate warmup. Resolved over real optimizer steps. |
+| `training.weight_decay` | `float` | `0.01` | `>= 0.0` | Weight decay factor (decoupled, AdamW-style) applied to weights during optimization; 0 disables it. |
+| `training.max_grad_norm` | `float` | `1.0` | `> 0` | Maximum gradient norm for gradient clipping. |
+| `training.lora` | `section` | section defaults |  | LoRA (Low-Rank Adaptation) adapter architecture and target modules. See [`training.lora`](#traininglora). |
 | `training.quantization` | `str` | `"4bit"` | one of `"4bit"`, `"8bit"`, `"none"`, `"gptq"`, `"awq"`, `"hqq:1bit"`, `"hqq:2bit"`, `"hqq:3bit"`, `"hqq:4bit"`, `"hqq:5bit"`, `"hqq:6bit"`, `"hqq:8bit"`, `"aqlm"`, `"eetq"`, `"mxfp4"`, `"fp8"`, `"bitnet_1.58"` | Quantization (v0.38.0 — Quant Menu): 4bit (BNB QLoRA), 8bit (BNB), none, gptq / awq (load pre-quantized checkpoint, train LoRA on top), hqq:Nbit (HQQ 1-8 bit, N in {1..6, 8}), aqlm (extreme 2-bit), eetq (8-bit fast), mxfp4 (MXFP4 pre-quantized base, dequantized on load), fp8 (load FP8 checkpoint with dequantize-on-load), bitnet_1.58 (reserved until BitNet trainer routing is available). |
 | `training.gptq_disable_exllama` | `bool` | `true` |  | v0.38.0 — disable exllama backend for GPTQ. PEFT requires triton backend; exllama silently breaks adapter training. |
 | `training.bnb_4bit_quant_storage` | `str \| null` | `null` | one of `"uint8"`, `"float16"`, `"bfloat16"`, `"float32"` | v0.38.0 — BNB 4-bit storage dtype. FSDP+QLoRA resolves this automatically to the effective floating compute dtype; outside FSDP, None keeps BNB's legacy uint8 default. |
@@ -170,7 +170,7 @@ Sections:
 | `training.off_policy_mask_threshold` | `float \| null` | `null` | `>= 0.0`, `<= 1.0` | Off-policy mask threshold for token/sequence gating (axolotl). Must be in \[0, 1]. None = disabled. |
 | `training.vision_grpo` | `bool` | `false` |  | Enable Vision RL / VLM RL — extends GRPO/PPO to vision modality (Qwen2-VL / Pixtral / InternVL). Requires modality='vision', task in {grpo, ppo}, backend in {transformers, unsloth}. Compatibility validation is available, but no trainer consumes this flag yet. |
 | `training.hub` | `str` | `"hf"` | one of `"hf"`, `"modelscope"`, `"modelers"` | Training-time model-download hub. 'hf' (default), 'modelscope' (China-hosted; mirrors most Llama/Qwen/etc.), 'modelers' (Openmind hub). `soup push --hub` selects its upload destination independently of this field. |
-| `training.tts_family` | `str \| null` | `null` | one of `"orpheus"`, `"sesame_csm"`, `"llasa"`, `"spark"`, `"oute"` | TTS model family — required when task='tts'. Runnable choices are orpheus, llasa, spark, and oute. sesame_csm is retained only so legacy configs receive an explicit refusal until Soup has a native CSM multimodal trainer. |
+| `training.tts_family` | `str \| null` | `null` | one of `"orpheus"`, `"sesame_csm"`, `"llasa"`, `"spark"`, `"oute"` | TTS model family — required when task='tts'. orpheus, llasa, spark and oute use codec-string SFT; sesame_csm uses a native multimodal trainer with raw audio and 32 parallel Mimi codebooks. |
 | `training.tts_emotion` | `str \| null` | `null` |  | Optional emotion tag for emotion-conditioned families (Orpheus / Oute). Allowlisted per-family. (v0.52.0) |
 | `training.num_labels` | `int \| null` | `null` | `>= 1`, `<= 1024` | Number of output labels for task in (classifier, reranker, cross_encoder). Required when task is one of those. (v0.52.0) |
 | `training.classifier_kind` | `str \| null` | `null` | one of `"single_label"`, `"multi_label"` | Sequence-classification head kind: single_label (default for task='classifier') or multi_label. (v0.52.0) |
@@ -256,6 +256,7 @@ Sections:
 | `training.moe_lora` | `bool` | `false` |  | Enable MoE-aware LoRA (ScatterMoE) — applies LoRA to expert FFN layers |
 | `training.moe_aux_loss_coeff` | `float` | `0.01` | `>= 0` | Auxiliary load-balancing loss coefficient for MoE models |
 | `training.use_liger` | `bool` | `false` |  | Enable Liger Kernel fused operations (20-60% memory savings, 20-40% speedup) |
+| `training.fast_lora` | `bool` | `false` |  | Run LoRA's q/k/v, MLP and other projections through Soup's hand-written Fast-LoRA autograd functions instead of peft's modules. Same math; no speedup is claimed. task='sft' on the transformers backend with text, quantization none or 4bit, and lora.dropout 0; refused beside use_liger, DoRA, VeRA, target_parameters, Spectrum, LISA and FP8 training. |
 | `training.use_flash_attn` | `bool` | `false` |  | Enable FlashAttention (auto-detects v2/v3/v4 for faster attention) |
 | `training.use_ring_attention` | `bool` | `false` |  | Enable Ring FlashAttention for sequence parallelism across GPUs |
 | `training.rope_scaling_type` | `str \| null` | `null` | one of `"linear"`, `"dynamic"`, `"yarn"`, `"llama3"` | RoPE scaling method for long-context: linear, dynamic, yarn or llama3 (v0.49.0). 'longrope' is refused at config load (#1239). Applied by task sft, tts and pretrain on backend: transformers (sft: the text path without layer streaming); refused at config load anywhere else (#1697). |

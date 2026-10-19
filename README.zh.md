@@ -1,7 +1,5 @@
-<!-- synced-from: README.md sha256:adcd1f2b7de834b9a4fd1d5acf17b5a15ef8f6c08e58e1efa62d152eb0b4fdb4 -->
+<!-- synced-from: README.md sha256:f4beaf4fb00428833a8f4a6541981266464c7b2b301c4ee492276477b27f7727 -->
 <p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <strong>中文</strong> | <a href="README.ru.md">Русский</a></p>
-<!-- synced-from: README.md sha256:fa009c2fcc2c94ea06e25ea8620c2fbed9bfb8ac6611bf71a2669a06f7c50b46 -->
-<p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <strong>中文</strong></p>
 
 <p align="center">
   <img src="soup.png" alt="Soup" width="280">
@@ -291,7 +289,7 @@ Alpaca、ShareGPT、ChatML、偏好对（DPO / ORPO / SimPO / IPO / KTO）、视
 ASR、纯文本、embedding、RAFT 等等——全部从 JSONL、JSON、CSV、Parquet 或 TXT 自动检测，
 所以多数情况下把 `data.train` 指向文件就行，其他什么都不用改。每种格式的 schema 和
 完整示例，加上数据管线（远程 URI、流式、分片、交错、词表扩展、文档导入），都在
-[`docs/data.md`](docs/data.md#data-formats)。
+[`docs/data.md`](docs/data.md#data-formats)，而 [Sesame CSM 原生音频训练](docs/training.md#native-sesame-csm) 则另有说明。
 
 ## 常用命令
 
@@ -480,4 +478,4 @@ v1 以来的任何实测数字也没有变。v3 做的是**撤回一个我们曾
 
 ## 许可证
 
-[Apache-2.0](LICENSE)。版权 © Soup 贡献者们。
+[Apache-2.0](LICENSE)。Copyright 2026 Makazhan Alpamys and the Soup contributors。如果你再分发 Soup 或其修改版本，许可证的第 4 条和第 6 条对你适用：每份副本都要保留 `LICENSE` 和 `NOTICE`，在你改动过的文件上注明改动，并且除说明作品来源之外不要使用 Soup 这一名称。

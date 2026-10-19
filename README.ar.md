@@ -1,7 +1,5 @@
-<!-- synced-from: README.md sha256:adcd1f2b7de834b9a4fd1d5acf17b5a15ef8f6c08e58e1efa62d152eb0b4fdb4 -->
+<!-- synced-from: README.md sha256:f4beaf4fb00428833a8f4a6541981266464c7b2b301c4ee492276477b27f7727 -->
 <p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <strong>العربية</strong> | <a href="README.ja.md">日本語</a> | <a href="README.zh.md">中文</a> | <a href="README.ru.md">Русский</a></p>
-<!-- synced-from: README.md sha256:fa009c2fcc2c94ea06e25ea8620c2fbed9bfb8ac6611bf71a2669a06f7c50b46 -->
-<p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <strong>العربية</strong> | <a href="README.ja.md">日本語</a> | <a href="README.zh.md">中文</a></p>
 
 <p align="center">
   <img src="soup.png" alt="Soup" width="280">
@@ -299,7 +297,7 @@ Alpaca وShareGPT وChatML وأزواج التفضيلات (DPO / ORPO / SimPO /
 العادي والتضمين (embedding) وRAFT وغيرها — كلها تُكتشف تلقائيًا من JSONL أو JSON أو CSV أو Parquet أو TXT،
 ولذلك تكتفي في معظم الحالات بتوجيه `data.train` إلى ملف دون أن يتغير شيء آخر. وتوجد المخططات مع مثال
 عملي لكل صيغة، إضافةً إلى خط أنابيب البيانات (معرّفات URI البعيدة، والبثّ، والتقسيم إلى شظايا (sharding)، والدمج المتناوب (interleaving)، وتوسيع
-المفردات، واستيعاب المستندات)، في [`docs/data.md`](docs/data.md#data-formats).
+المفردات، واستيعاب المستندات)، في [`docs/data.md`](docs/data.md#data-formats)، مع توثيق [تدريب الصوت الأصلي لـ Sesame CSM](docs/training.md#native-sesame-csm) بشكل منفصل.
 
 ## الأوامر الشائعة
 
@@ -490,4 +488,4 @@ Soup مرخَّص بـ Apache-2.0 ومجاني — وسيبقى كذلك. يُب
 
 ## الترخيص
 
-[Apache-2.0](LICENSE). حقوق النشر © مساهمو Soup.
+[Apache-2.0](LICENSE). Copyright 2026 Makazhan Alpamys and the Soup contributors. إذا أعدتَ توزيع Soup أو نسخة معدَّلة منه، فإن البندين 4 و6 من الترخيص ينطبقان عليك: احتفظ بالملفين `LICENSE` و`NOTICE` مع كل نسخة، وضع علامة على الملفات التي غيّرتها، ولا تستخدم اسم Soup إلا لبيان مصدر العمل.
