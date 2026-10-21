@@ -126,7 +126,7 @@ _MAX_BENCHMARK_NAME_CHARS = 256
 
 def _fail(message: str, code: int) -> NoReturn:
     """Print a friendly red error and raise ``typer.Exit(code)``."""
-    console.print(f"[red]Error:[/] {escape(message)}")
+    console.print(f"[red]Error:[/] {escape(for_terminal(message))}")
     raise typer.Exit(code=code)
 
 
@@ -455,7 +455,7 @@ def _flag_is_default(ctx: typer.Context, name: str) -> bool:
     make a flag config-overridable.
     """
     try:
-        from click.core import ParameterSource
+        from soup_cli.utils.typer_compat import ParameterSource
 
         source = ctx.get_parameter_source(name)
     except (ImportError, AttributeError):  # pragma: no cover — defensive
