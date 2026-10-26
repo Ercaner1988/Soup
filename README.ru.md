@@ -1,4 +1,4 @@
-<!-- synced-from: README.md sha256:f4beaf4fb00428833a8f4a6541981266464c7b2b301c4ee492276477b27f7727 -->
+<!-- synced-from: README.md sha256:68116cad1e8bc34f44b84b0bd129b759a4bb925afbac84118cfd2309480c83b1 -->
 <p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <a href="README.zh.md">中文</a> | <strong>Русский</strong></p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 <p align="center">
   <a href="https://pypi.org/project/soup-cli/"><img src="https://img.shields.io/pypi/v/soup-cli?color=blue" alt="PyPI"></a>
   <a href="https://pepy.tech/project/soup-cli"><img src="https://img.shields.io/pepy/dt/soup-cli?color=blue" alt="Загрузки"></a>
-  <img src="https://img.shields.io/badge/python-3.10--3.12-blue" alt="Python 3.10-3.12">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-blue" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Лицензия Apache-2.0">
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/MakazhanAlpamys/65fdc943f85f3b2c46ecddb415c2b779/raw/soup_tests.json" alt="Тесты"></a>
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -355,7 +355,7 @@ docker compose up   # or build locally
 
 ## Требования
 
-- Python 3.10, 3.11 или 3.12 (именно эти версии тестируются в CI; 3.13+ пока не поддерживается,
+- Python 3.11, 3.12 или 3.13 (именно эти версии тестируются в CI; 3.14+ пока не поддерживается,
   потому что стек PyTorch на них ещё не проверен)
 - GPU с CUDA (рекомендуется), Apple Silicon (MPS) или CPU (экспериментально — очень медленно)
 - 8 GB+ VRAM для моделей на 7B с QLoRA

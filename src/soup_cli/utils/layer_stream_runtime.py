@@ -16,6 +16,7 @@ their adapters. This is physics, not an implementation detail.
 importing without the training stack.
 """
 
+import contextlib
 import logging
 import math
 import os
@@ -364,6 +365,118 @@ def _checkpoint_visible_nf4_function():
     return CheckpointVisibleNF4Matmul
 
 
+_PACKED_DEQUANT_NF4_FUNCTION = None
+
+
+def _packed_dequant_nf4_function():
+    """Lazy autograd Function: dense-dequant forward, PACKED-only saved state.
+
+    For a streamed layer that runs WITHOUT checkpoint recompute. ``F.linear`` on
+    a dequantised weight would save the dense bf16 weight for the backward (437 MB
+    per Mistral-7B layer); this saves only the packed bytes and the quantisation
+    tensors through ``save_for_backward`` and dequantises again for ``grad_x``.
+    The forward arithmetic is the compatibility path's (dequantise + ``F.linear``)
+    and the backward's ``grad_y @ W`` is the same GEMM ``F.linear``'s backward
+    issues, so outputs and gradients stay bit-identical to the recompute path.
+    """
+    global _PACKED_DEQUANT_NF4_FUNCTION
+    if _PACKED_DEQUANT_NF4_FUNCTION is not None:
+        return _PACKED_DEQUANT_NF4_FUNCTION
+
+    import bitsandbytes.functional as bnb_functional
+    import torch
+    import torch.nn.functional as functional
+
+    def _state(ctx, absmax, state2_absmax, state2_code, offset):
+        state2 = None
+        q_offset = None
+        if ctx.nested:
+            state2 = bnb_functional.QuantState(
+                absmax=state2_absmax,
+                code=state2_code,
+                blocksize=ctx.state2_blocksize,
+                dtype=torch.float32,
+            )
+            q_offset = offset
+        return bnb_functional.QuantState(
+            absmax=absmax,
+            shape=torch.Size(ctx.shape),
+            code=ctx.code,
+            dtype=ctx.weight_dtype,
+            blocksize=ctx.blocksize,
+            quant_type=ctx.quant_type,
+            offset=q_offset,
+            state2=state2,
+        )
+
+    class PackedDequantNF4Linear(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, packed, absmax, state2_absmax, state2_code, offset, bias, meta):
+            shape, weight_dtype, blocksize, quant_type, nested, state2_blocksize, code = meta
+            ctx.shape = tuple(int(dim) for dim in shape)
+            ctx.weight_dtype = weight_dtype
+            ctx.blocksize = int(blocksize)
+            ctx.quant_type = str(quant_type)
+            ctx.nested = bool(nested)
+            ctx.state2_blocksize = int(state2_blocksize)
+            ctx.code = code
+            ctx.bias_dtype = None if bias is None else bias.dtype
+            ctx.owner_check = getattr(packed, "_soup_stream_owner_check", None)
+            weight = bnb_functional.dequantize_4bit(
+                packed, _state(ctx, absmax, state2_absmax, state2_code, offset)
+            ).to(x.dtype)
+            ctx.save_for_backward(packed, absmax, state2_absmax, state2_code, offset)
+            return functional.linear(x, weight, bias)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            packed, absmax, state2_absmax, state2_code, offset = ctx.saved_tensors
+            if ctx.owner_check is not None:
+                ctx.owner_check()
+            grad_x = None
+            if ctx.needs_input_grad[0]:
+                weight = bnb_functional.dequantize_4bit(
+                    packed, _state(ctx, absmax, state2_absmax, state2_code, offset)
+                ).to(grad_output.dtype)
+                grad_x = torch.matmul(grad_output, weight)
+            grad_bias = None
+            if ctx.needs_input_grad[6] and ctx.bias_dtype is not None:
+                grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(
+                    dim=0, dtype=ctx.bias_dtype
+                )
+            return grad_x, None, None, None, None, None, grad_bias, None
+
+    _PACKED_DEQUANT_NF4_FUNCTION = PackedDequantNF4Linear
+    return PackedDequantNF4Linear
+
+
+def packed_dequant_nf4_linear(x: Any, packed: Any, quant_state: Any, bias: Any = None) -> Any:
+    """Dense-dequant NF4 linear that saves only packed state for its backward
+    (training.stream_recompute 'off' / 'auto')."""
+    empty = packed.new_empty((0,))
+    state2_absmax = empty
+    state2_code = empty
+    offset = empty
+    state2_blocksize = 0
+    if quant_state.nested:
+        state2_absmax = quant_state.state2.absmax
+        state2_code = quant_state.state2.code
+        offset = quant_state.offset
+        state2_blocksize = int(quant_state.state2.blocksize)
+    meta = (
+        tuple(quant_state.shape),
+        quant_state.dtype,
+        int(quant_state.blocksize),
+        str(quant_state.quant_type),
+        bool(quant_state.nested),
+        state2_blocksize,
+        quant_state.code,
+    )
+    return _packed_dequant_nf4_function().apply(
+        x, packed, quant_state.absmax, state2_absmax, state2_code, offset, bias, meta
+    )
+
+
 def checkpoint_visible_nf4_linear(
     x: Any, packed: Any, quant_state: Any, bias: Any = None
 ) -> Any:
@@ -474,6 +587,7 @@ def install_dequant_forward(module: Any) -> int:
     import types
 
     import bitsandbytes as bnb
+    import torch
     import torch.nn.functional as functional
     from bitsandbytes.functional import dequantize_4bit
 
@@ -508,6 +622,11 @@ def install_dequant_forward(module: Any) -> int:
         scale_cache = getattr(self.weight, "_soup_scale_cache", None)
         if scale_cache is not None:
             quant_state = scale_cache.dense_state(self.weight._soup_scale_cache_key, quant_state)
+        if getattr(self, "_soup_packed_backward", False) and torch.is_grad_enabled():
+            # training.stream_recompute — no checkpoint recompute around this
+            # layer: never let F.linear save the dense weight; save the packed
+            # bytes instead.
+            return packed_dequant_nf4_linear(x, self.weight, quant_state, bias).to(inp_dtype)
         weight = dequantize_4bit(self.weight, quant_state).to(x.dtype)
         return functional.linear(x, weight, bias).to(inp_dtype)
 
@@ -1173,6 +1292,9 @@ class LayerBufferPool:
         ]
         self.events = [torch.cuda.Event() for _ in range(self.n)] if self.is_cuda else []
         self.owner: list = [None] * self.n
+        # Bumped on every load into a slot, so a reader can tell a slot that was
+        # refilled (even with the same layer) from one that was not.
+        self.generation: list = [0] * self.n
         if active_keys_by_layer is None:
             shared = tuple(layer_spec)
             self.active_keys_by_layer = [shared]
@@ -1215,6 +1337,7 @@ class LayerBufferPool:
             # into a small reusable pool refills sooner for it.
             _release_source(source, idx, None)
         self.owner[slot] = idx
+        self.generation[slot] += 1
         self.loads += 1
         return slot
 
@@ -1491,6 +1614,21 @@ def _build_streamed_layer_class():
             self.prefetcher = prefetcher
             self.name_map = dict(name_map or {})
             self.use_checkpoint = bool(use_checkpoint)
+            # training.stream_recompute — False: no checkpoint recompute.
+            # Activations stay saved; pool-slot tensors are saved as tokens and
+            # the layer is re-visited (wait + prefetch) at its first backward
+            # unpack instead of at the recompute. See _body_retained /
+            # set_stream_recompute.
+            self.recompute = True
+            self._bwd_visited = True
+            # The pool slot's load generation at the first backward visit; a
+            # later unpack refuses a slot that was reloaded since, even with the
+            # same owner.
+            self._bwd_generation = None
+            self._slot_ptrs: Dict[int, frozenset] = {}
+            # training.stream_recompute='auto' — a RetainedLayerProbe armed on
+            # this layer measures its next no-recompute forward, then disarms.
+            self._retained_probe = None
             self.quant_specs = dict(quant_specs or {})
             self.codes = dict(codes or {})
             # training.stream_nf4_scale_cache — an NF4ScaleCache owned by the
@@ -1726,8 +1864,76 @@ def _build_streamed_layer_class():
 
         def forward(self, hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
             if self.use_checkpoint and torch.is_grad_enabled():
+                if not self.recompute:
+                    return self._body_retained(hidden_states, *args, **kwargs)
                 return checkpoint(self._body, hidden_states, *args, use_reentrant=False, **kwargs)
             return self._body(hidden_states, *args, **kwargs)
+
+        def _pool_ptrs(self) -> frozenset:
+            slot = self.pool.slot_for(self.idx)
+            ptrs = self._slot_ptrs.get(slot)
+            if ptrs is None:
+                ptrs = frozenset(
+                    buf.untyped_storage().data_ptr() for buf in self.pool.buffers[slot].values()
+                )
+                self._slot_ptrs[slot] = ptrs
+            return ptrs
+
+        def _backward_visit(self) -> None:
+            # The first unpack of this layer's pool tensors in the backward is
+            # where the recompute used to run: same wait + prefetch, same order.
+            slot = self.pool.slot_for(self.idx)
+            if not self._bwd_visited:
+                self._bwd_visited = True
+                self.pool.wait(self.idx)
+                # Recorded after the wait (the slot holds this layer now) and
+                # before the prefetch, which loads a DIFFERENT slot.
+                self._bwd_generation = self.pool.generation[slot]
+                self.prefetcher.advance(self.idx)
+                return
+            if self.pool.owner[slot] != self.idx:
+                raise RuntimeError(
+                    f"streamed backward (no recompute) found slot {slot} holding layer "
+                    f"{self.pool.owner[slot]} while layer {self.idx} still unpacks from it"
+                )
+            if self.pool.generation[slot] != self._bwd_generation:
+                raise RuntimeError(
+                    f"streamed backward (no recompute) found slot {slot} reloaded "
+                    f"(load generation {self._bwd_generation} -> "
+                    f"{self.pool.generation[slot]}) while layer {self.idx} still unpacks "
+                    "from it"
+                )
+
+        def _body_retained(self, hidden_states: Any, *args: Any, **kwargs: Any) -> Any:
+            ptrs = self._pool_ptrs()
+            token = _POOL_TOKEN
+
+            def pack(tensor: Any) -> Any:
+                try:
+                    ptr = tensor.untyped_storage().data_ptr()
+                except (AttributeError, RuntimeError):
+                    return tensor
+                if ptr in ptrs:
+                    return (token, tensor)
+                return tensor
+
+            def unpack(obj: Any) -> Any:
+                if type(obj) is tuple and len(obj) == 2 and obj[0] is token:
+                    self._backward_visit()
+                    return obj[1]
+                return obj
+
+            self._bwd_visited = False
+            probe = self._retained_probe
+            if probe is not None:
+                # One forward only: the probe restores the recompute after it.
+                self._retained_probe = None
+                probe.start(self)
+            with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+                out = self._body(hidden_states, *args, **kwargs)
+            if probe is not None:
+                probe.finish(self, out)
+            return out
 
         def _substituted_weights(self, buffers: Any) -> Any:
             # Weights arrive with requires_grad=False, so autograd allocates no
@@ -1787,6 +1993,385 @@ def _build_streamed_layer_class():
 
 
 _STREAMED_LAYER_CLASS = None
+_POOL_TOKEN = object()
+
+
+def set_stream_recompute(model: Any, enabled: bool, *, retain: Optional[int] = None) -> int:
+    """training.stream_recompute — switch every streamed decoder layer between the
+    checkpoint recompute (True, the default) and retained activations (False).
+    Returns the number of streamed layers found.
+
+    ``retain`` (only with ``enabled=False``): how many layers skip the recompute
+    (the LAST ``retain`` layers); the rest keep the checkpoint recompute.
+    ``None`` = all layers. Peak VRAM grows by one layer's activations per
+    retained layer, whichever layers they are. A retained layer's NF4 linears
+    save only the packed bytes for the backward (``packed_dequant_nf4_linear``)."""
+    if retain is not None and (
+        isinstance(retain, bool) or not isinstance(retain, int) or retain < 0
+    ):
+        raise ValueError(f"retain must be None or an int >= 0; got {retain!r}")
+    streamed = streamed_decoder_layers(model)
+    order = [module.idx for module in streamed]
+    kept = set(order if retain is None else (order[-retain:] if retain > 0 else []))
+    for module in streamed:
+        skip = not enabled and module.idx in kept
+        _set_layer_recompute(module, skip=skip)
+        module._bwd_visited = True
+    return len(streamed)
+
+
+def streamed_decoder_layers(model: Any) -> list:
+    """Every ``StreamedDecoderLayer`` under ``model``, sorted by layer index.
+
+    The wrapper is transparent to ``named_modules()`` (it yields only its inner
+    layer's modules), so it is reached through its parent's ``_modules``.
+    """
+    cls = _streamed_layer_class()
+    streamed = []
+    seen = set()
+    for parent in model.modules():
+        for child in parent._modules.values():
+            if isinstance(child, cls) and id(child) not in seen:
+                seen.add(id(child))
+                streamed.append(child)
+    return sorted(streamed, key=lambda module: module.idx)
+
+
+def _linear4bit_class() -> Any:
+    """``bitsandbytes.nn.Linear4bit``. Only reached for a layer whose NF4
+    linears were patched, which already required bitsandbytes."""
+    import bitsandbytes as bnb
+
+    return bnb.nn.Linear4bit
+
+
+def _set_layer_recompute(module: Any, *, skip: bool) -> None:
+    """One streamed layer: ``skip`` = no checkpoint recompute. Its NF4 linears
+    then save the packed bytes, not the dense weight, for the backward. A layer
+    with no patched NF4 linear (``n_dequant_forward == 0``) has none to flag, and
+    bitsandbytes is not imported for it."""
+    module.recompute = not skip
+    if not getattr(module, "n_dequant_forward", 0):
+        return
+    linear4bit = _linear4bit_class()
+    for child in module.inner.modules():
+        if isinstance(child, linear4bit):
+            child._soup_packed_backward = skip
+
+
+def _output_nbytes(output: Any) -> int:
+    """Bytes of every tensor in a layer's output (a tensor, or nested containers)."""
+    if hasattr(output, "untyped_storage") and hasattr(output, "element_size"):
+        return int(output.numel() * output.element_size())
+    if isinstance(output, Mapping):
+        return sum(_output_nbytes(value) for value in output.values())
+    if isinstance(output, (tuple, list)):
+        return sum(_output_nbytes(value) for value in output)
+    return 0
+
+
+class RetainedLayerProbe:
+    """training.stream_recompute='auto' — what ONE streamed layer keeps allocated
+    when it skips the checkpoint recompute.
+
+    ``arm(model)`` switches the LAST streamed layer to no-recompute for its next
+    grad-enabled forward only, and that forward reads the allocator before and
+    after the layer's body: ``after - before - output bytes`` is what the layer
+    holds for its backward. The input was allocated before and is saved by the
+    recompute path too, so it is not counted; pool-slot tensors are saved as
+    tokens and cost nothing. Bytes the NF4 scale cache fills during that forward
+    are persistent, not retained, and are subtracted. Allocated memory is read,
+    never a difference of peaks: peaks are not additive, and a peak difference
+    under-estimated a Mistral-7B layer 3x at 1024 tokens (benchmarks/exp-1c-
+    streaming-without-recompute.md, section 6). The layer's mode is restored
+    right after the measured forward; its backward still runs the no-recompute
+    path, bit-identical to the recompute.
+
+    ``allocated`` reads the allocator; None = ``torch.cuda.memory_allocated`` on
+    the layer's device, which needs a CUDA pool. Every failure is recorded in
+    ``error`` instead of being raised into the training step.
+    """
+
+    def __init__(self, allocated: Optional[Callable[[], int]] = None):
+        self._allocated = allocated
+        self.per_layer_bytes: Optional[int] = None
+        self.layer_idx: Optional[int] = None
+        self.error: Optional[str] = None
+        self._before: Optional[int] = None
+        self._cache_before = 0
+
+    def arm(self, model: Any) -> Optional[int]:
+        """Arm the last streamed layer; returns its index, or None (``error`` says why)."""
+        layers = streamed_decoder_layers(model)
+        if not layers:
+            self.error = "the model has no streamed decoder layers"
+            return None
+        last = layers[-1]
+        if self._allocated is None:
+            pool = getattr(last, "pool", None)
+            if not getattr(pool, "is_cuda", False):
+                self.error = "no CUDA device to measure the retained bytes on"
+                return None
+            import torch
+
+            device = pool.device
+            self._allocated = lambda: int(torch.cuda.memory_allocated(device))
+        _set_layer_recompute(last, skip=True)
+        last._retained_probe = self
+        self.error = None
+        return last.idx
+
+    def disarm(self, model: Any) -> None:
+        """Drop an armed probe whose forward never ran, restoring that layer."""
+        for layer in streamed_decoder_layers(model):
+            if layer._retained_probe is self:
+                layer._retained_probe = None
+                _set_layer_recompute(layer, skip=False)
+
+    @staticmethod
+    def _cache_bytes(layer: Any) -> int:
+        return int(getattr(getattr(layer, "scale_cache", None), "nbytes", 0) or 0)
+
+    def start(self, layer: Any) -> None:
+        try:
+            self._cache_before = self._cache_bytes(layer)
+            self._before = int(self._allocated())
+        except Exception as exc:  # noqa: BLE001 — a measurement must not stop training
+            self._before = None
+            self.error = f"the measurement raised {type(exc).__name__}: {exc}"
+
+    def finish(self, layer: Any, output: Any) -> None:
+        try:
+            if self._before is not None:
+                after = int(self._allocated())
+                filled = self._cache_bytes(layer) - self._cache_before
+                self.per_layer_bytes = after - self._before - filled - _output_nbytes(output)
+                self.layer_idx = layer.idx
+        except Exception as exc:  # noqa: BLE001 — a measurement must not stop training
+            self.per_layer_bytes = None
+            self.error = f"the measurement raised {type(exc).__name__}: {exc}"
+        finally:
+            # The flags are read in the forward, so restoring them now leaves this
+            # step's backward on the no-recompute path it was recorded for.
+            _set_layer_recompute(layer, skip=False)
+
+
+def _fmt_bytes(count: int) -> str:
+    if abs(count) >= 10**9:
+        return f"{count / 1e9:.2f} GB"
+    if abs(count) >= 10**6:
+        return f"{count / 1e6:.1f} MB"
+    return f"{count} bytes"
+
+
+class CudaMemoryReader:
+    """The allocator figures ``stream_recompute='auto'`` reads, on one CUDA device."""
+
+    def __init__(self, device: Any):
+        self.device = device
+
+    def reset_peak(self) -> None:  # pragma: no cover - CUDA only
+        import torch
+
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+    def synchronize(self) -> None:  # pragma: no cover - CUDA only
+        import torch
+
+        torch.cuda.synchronize(self.device)
+
+    def allocated(self) -> int:  # pragma: no cover - CUDA only
+        import torch
+
+        return int(torch.cuda.memory_allocated(self.device))
+
+    def peak_allocated(self) -> int:  # pragma: no cover - CUDA only
+        import torch
+
+        return int(torch.cuda.max_memory_allocated(self.device))
+
+    def peak_reserved(self) -> int:  # pragma: no cover - CUDA only
+        import torch
+
+        return int(torch.cuda.max_memory_reserved(self.device))
+
+    def reserved(self) -> int:  # pragma: no cover - CUDA only
+        import torch
+
+        return int(torch.cuda.memory_reserved(self.device))
+
+    def free(self) -> int:  # pragma: no cover - CUDA only
+        import torch
+
+        return int(torch.cuda.mem_get_info(self.device)[0])
+
+    def total(self) -> int:  # pragma: no cover - CUDA only
+        import torch
+
+        return int(torch.cuda.get_device_properties(self.device).total_memory)
+
+    def release(self) -> None:  # pragma: no cover - CUDA only
+        import torch
+
+        torch.cuda.empty_cache()
+
+
+def _synthetic_step(model: Any, *, rows: int, seq_len: int, vocab_size: int, device: Any) -> None:
+    """One forward+backward on random ids at the configured shape, gradients dropped.
+
+    Synthetic for the reason :func:`measure_step_peak_bytes` gives: the CONFIGURED
+    shape is the worst case any real batch can pad up to, a real batch measures
+    whatever length it happened to have.
+    """
+    import torch
+
+    ids = torch.randint(0, vocab_size, (rows, seq_len), device=device)
+    out = None
+    try:
+        out = model(input_ids=ids, labels=ids)
+        out.loss.backward()
+    finally:
+        del ids, out
+        _zero_probe_grads(model)
+
+
+def plan_stream_recompute_auto(
+    model: Any,
+    *,
+    rows: int,
+    seq_len: int,
+    vocab_size: int,
+    notify: Callable[[str], Any],
+    override_bytes: Optional[int] = None,
+    headroom: Optional[float] = None,
+    memory: Any = None,
+    step: Optional[Callable[..., None]] = None,
+) -> int:
+    """training.stream_recompute='auto' — decide, before training, how many of the
+    LAST streamed layers keep their activations, and switch them. Returns ``K``.
+
+    One synthetic forward+backward at the configured shape (``rows`` x
+    ``seq_len``, the shape the VRAM probe measures) runs with the checkpoint
+    recompute on every layer but the last, which a :class:`RetainedLayerProbe`
+    measures: its allocated bytes, charged at the step's reserved/allocated ratio
+    when that is above 1. The step's RESERVED peak (which therefore already holds
+    the measured layer, so ``K`` errs low by up to one) is taken from
+    :func:`~soup_cli.utils.layer_stream.stream_recompute_budget`'s cap, and ``K =
+    budget // charge`` clamped to the layer count. Anything that cannot be
+    measured keeps the checkpoint recompute everywhere and says why; that
+    includes an out-of-memory in the synthetic step. Any other exception of the
+    step propagates, as the VRAM probe treats one (:func:`_classify_probe_exception`).
+
+    ``memory`` reads the allocator (:class:`CudaMemoryReader` on the streamed
+    layers' device when None, which needs a CUDA pool); ``step`` runs the
+    synthetic step (:func:`_synthetic_step` when None).
+    """
+    from soup_cli.utils.layer_stream import (
+        RECOMPUTE_CAP_CARD,
+        RECOMPUTE_CAP_FREE,
+        STREAM_RECOMPUTE_HEADROOM,
+        plan_retained_layers,
+        retained_layer_charge,
+        stream_recompute_budget,
+    )
+    from soup_cli.utils.terminal import for_terminal
+
+    headroom = STREAM_RECOMPUTE_HEADROOM if headroom is None else headroom
+    layers = streamed_decoder_layers(model)
+    n_layers = len(layers)
+
+    def keep(why: str) -> int:
+        set_stream_recompute(model, True)
+        notify(
+            f"[yellow]training.stream_recompute='auto' keeps the recompute on all "
+            f"{n_layers} streamed layers:[/] {for_terminal(why)}"
+        )
+        return 0
+
+    if not layers:
+        return keep("the model has no streamed decoder layers")
+    if min(rows, seq_len, vocab_size) < 1:
+        return keep(
+            f"no step shape to measure (batch {rows} x seq {seq_len}, vocab_size {vocab_size})"
+        )
+    device = layers[-1].pool.device
+    if memory is None:
+        if not getattr(layers[-1].pool, "is_cuda", False):
+            return keep("no CUDA device to measure VRAM on")
+        memory = CudaMemoryReader(device)
+    run = _synthetic_step if step is None else step
+    shape = f"batch {rows} x seq {seq_len}"
+    probe = RetainedLayerProbe(allocated=memory.allocated)
+    probe.arm(model)
+    try:
+        memory.reset_peak()
+        run(model, rows=rows, seq_len=seq_len, vocab_size=vocab_size, device=device)
+        memory.synchronize()
+        peak_reserved = memory.peak_reserved()
+        peak_allocated = memory.peak_allocated()
+        free = memory.free()
+        reserved = memory.reserved()
+        total = memory.total()
+    except Exception as exc:
+        # An out-of-memory is a result, as it is for the VRAM probe: this shape
+        # does not fit even with one layer retained. Anything else (an illegal
+        # access, a device assert, a bug) may leave the context unusable, so it
+        # propagates and the setup closes the runtime and refuses the run.
+        if not _is_out_of_memory(exc):
+            raise
+        return keep(
+            f"the synthetic step at {shape} ran out of memory, so the configured shape "
+            "does not fit with one layer retained; set training.stream_vram_probe: true "
+            "to measure whether it fits at all"
+        )
+    finally:
+        probe.disarm(model)
+        try:
+            memory.release()
+        except Exception:  # noqa: BLE001 — a cache flush must not mask the result
+            logger.warning("stream_recompute='auto': releasing the allocator cache failed")
+    per_layer = probe.per_layer_bytes
+    if per_layer is None:
+        return keep(probe.error or "the measured forward did not run")
+    if per_layer <= 0:
+        return keep(f"one layer measured at {_fmt_bytes(per_layer)} retained (<= 0)")
+    charge = retained_layer_charge(per_layer, peak_reserved, peak_allocated)
+    budget = stream_recompute_budget(
+        total_bytes=total,
+        free_bytes=free,
+        reserved_bytes=reserved,
+        reserved_peak_bytes=peak_reserved,
+        override_bytes=override_bytes,
+        headroom=headroom,
+    )
+    if budget.bound == RECOMPUTE_CAP_CARD:
+        cap = f"{headroom:.0%} of the card's {_fmt_bytes(total)}"
+    elif budget.bound == RECOMPUTE_CAP_FREE:
+        cap = f"free + reserved VRAM {_fmt_bytes(free + reserved)}"
+    else:
+        cap = f"training.stream_vram_override {_fmt_bytes(budget.cap_bytes)}"
+    if budget.budget_bytes <= 0:
+        return keep(
+            f"no VRAM headroom: {cap} minus the reserved peak of the {shape} step, "
+            f"{_fmt_bytes(peak_reserved)}, is {_fmt_bytes(budget.budget_bytes)}"
+        )
+    k = plan_retained_layers(budget.budget_bytes, charge, n_layers)
+    if k == 0:
+        return keep(
+            f"one layer ({_fmt_bytes(charge)} charged) does not fit the budget of "
+            f"{_fmt_bytes(budget.budget_bytes)}"
+        )
+    set_stream_recompute(model, False, retain=k)
+    ratio = peak_reserved / peak_allocated if peak_allocated > 0 else 1.0
+    notify(
+        f"[cyan]training.stream_recompute='auto':[/] the last {k} of {n_layers} streamed "
+        f"layers keep their activations, the rest recompute (measured at {shape}: one "
+        f"layer {_fmt_bytes(per_layer)} retained, charged {_fmt_bytes(charge)} at "
+        f"reserved/allocated {ratio:.2f}; budget {_fmt_bytes(budget.budget_bytes)} = "
+        f"{cap} minus the reserved peak {_fmt_bytes(peak_reserved)})"
+    )
+    return k
 
 
 def _streamed_layer_class():
@@ -1838,36 +2423,26 @@ def _unwrap_tuner_base(module: Any) -> Any:
     return module
 
 
-def _refuse_lora_on_streamed_boundary(model: Any, index: Any, lora_config: Any) -> None:
-    """Refuse a LoRA target on the streamed embedding or head (#1048).
+def _refuse_trainable_streamed_boundary(model: Any, index: Any, lora_config: Any) -> None:
+    """An externally supplied modules_to_save must not unfreeze a streamed base.
 
-    Saving or resuming that adapter is not supported yet. Checked after
-    get_peft_model(), so it covers every spelling of ``target_modules`` that
-    matched the module, and only when the checkpoint streams those weights: a
-    tied one has no large-layer keys and keeps both modules resident.
+    Soup exposes LoRA targets, not modules_to_save. Guard the lower-level build
+    API before PEFT wraps/copies these meta modules, where it would fail late.
     """
-    if not tuple(getattr(index, "large_keys", ()) or ()):
+    targets = getattr(lora_config, "modules_to_save", None)
+    if not targets or not tuple(getattr(index, "large_keys", ()) or ()):
         return
-    from peft.tuners.tuners_utils import BaseTunerLayer
-
-    wrapped = [
-        role
-        for role, module in (
-            ("embed_tokens", model.get_input_embeddings()),
-            ("lm_head", model.get_output_embeddings()),
-        )
-        if isinstance(module, BaseTunerLayer)
-    ]
-    if wrapped:
-        names = ", ".join(wrapped)
-        raise ValueError(
-            f"training.stream_layers does not yet support a LoRA target on the "
-            f"streamed {names} of an untied checkpoint: the forward pass is "
-            f"correct, but saving or resuming that adapter is not supported yet. "
-            f"Change training.lora.target_modules (now "
-            f"{lora_config.target_modules!r}) so it does not match {names}, or "
-            f"train without stream_layers."
-        )
+    if isinstance(targets, str):
+        targets = (targets,)
+    boundaries = (model.get_input_embeddings(), model.get_output_embeddings())
+    for name, module in model.named_modules():
+        if any(module is boundary for boundary in boundaries) and any(
+            name == target or name.endswith("." + target) for target in targets
+        ):
+            raise ValueError(
+                f"modules_to_save targets the frozen streamed boundary {name!r}; "
+                "use a LoRA target for this module or train without stream_layers"
+            )
 
 
 def _build_streamed_large_layer_class():
@@ -1879,12 +2454,18 @@ def _build_streamed_large_layer_class():
         """Embedding or output projection backed by the shared large slot."""
 
         def __init__(
-            self, inner: Any, key: str, pool: Any, refill_before_backward: bool = False
-        ):
+            self,
+            inner: Any,
+            key: str,
+            pool: Any,
+            refill_before_backward: bool = False,
+            weight_path: Optional[str] = None,
+        ) -> None:
             super().__init__()
             self.inner = inner
             self.key = str(key)
             self.pool = pool
+            self.weight_path = weight_path
             # #1049 -- set by the trainers whose loss runs a second forward before
             # the step's backward (see `_needs_a_private_weight`).
             self.refill_before_backward = bool(refill_before_backward)
@@ -1910,6 +2491,30 @@ def _build_streamed_large_layer_class():
                         f"malformed, re-save the adapter"
                     )
                 state_dict[redirected] = value
+            # PEFT's embedding export may include the frozen base alongside
+            # the adapter. It must agree with the shard feeding forward: a
+            # torch copy into a meta parameter would silently discard a
+            # different base. Keep the placeholder, even with assign=True.
+            weight_key = inner_prefix + self._weight_param_name
+            value = state_dict.get(weight_key)
+            if self.weight_path is not None and value is not None and not value.is_meta:
+                if not torch.equal(value.detach().cpu(), self._frozen_weight_snapshot()):
+                    raise ValueError(
+                        f"checkpoint frozen base for {self.key!r} differs from the "
+                        "streaming shard; resume with the original base checkpoint "
+                        "and its matching shard cache"
+                    )
+                state_dict[weight_key] = self.inner.get_parameter(self._weight_param_name).detach()
+
+        def _frozen_weight_snapshot(self) -> Any:
+            from safetensors import safe_open
+
+            # Never read pool.wait(): input and output share storage and the
+            # slot may currently hold the other boundary (or an async copy).
+            # Reading the shard also works independently of a disk-tier
+            # source's live staging buffers. Clone before closing its mapping.
+            with safe_open(self.weight_path, framework="pt", device="cpu") as handle:
+                return handle.get_tensor(self.key).clone()
 
         def _apply(self, fn: Any, recurse: bool = True) -> Any:
             def _skip_meta(tensor: Any) -> Any:
@@ -1984,9 +2589,16 @@ def _build_streamed_large_layer_class():
                     prefix = args[1]
                 if len(args) > 2 and keep_vars is False:
                     keep_vars = args[2]
-            return self.inner.state_dict(
+            state = self.inner.state_dict(
                 destination=destination, prefix=prefix, keep_vars=keep_vars
             )
+            if self.weight_path is not None and hasattr(self.inner, "base_layer"):
+                # PEFT obtains state_dict BEFORE deciding auto/True/False for
+                # save_embedding_layers. Only tuner-wrapped boundaries need
+                # independent CPU bytes; leave untargeted weights on meta and
+                # avoid reading their vocabulary-sized shards on every save.
+                state[prefix + self._weight_param_name] = self._frozen_weight_snapshot()
+            return state
 
         def __getattr__(self, name: str) -> Any:
             try:
@@ -2087,6 +2699,76 @@ def _replace_module_references(root: Any, target: Any, replacement: Any) -> int:
     return replaced
 
 
+def _attach_streamed_boundary_adapter_bridge(model: Any) -> None:
+    """Let PEFT inject/load adapters without changing streaming placement.
+
+    PEFT resolves a target through its parent attribute, which is our streamed
+    wrapper rather than the canonical tuner yielded by named_modules(). TRL
+    DPO uses add_adapter to make its reference. Expose the tuner only during
+    injection and restore streaming even if PEFT raises partway through it.
+    PEFT's load_adapter otherwise re-plans CPU/disk models across available
+    accelerators, which cannot move this runtime's independently owned pools.
+    This is scoped to this model, never a patch of PEFT's global classes.
+    """
+    if not hasattr(model, "peft_config"):
+        return
+    from types import MethodType
+
+    add_adapter = type(model).add_adapter
+    load_adapter = type(model).load_adapter
+
+    def _load_adapter(
+        self: Any, model_id: Any, adapter_name: str, is_trainable: bool = False,
+        torch_device: Optional[str] = None, *args: Any, **kwargs: Any,
+    ) -> Any:
+        runtime_map = getattr(self, "hf_device_map", None)
+        if isinstance(runtime_map, dict) and "" in runtime_map:
+            if torch_device is None:
+                device = runtime_map[""]
+                torch_device = f"cuda:{device}" if isinstance(device, int) else str(device)
+            kwargs.setdefault("device_map", dict(runtime_map))
+        return load_adapter(
+            self, model_id, adapter_name, is_trainable, torch_device, *args, **kwargs
+        )
+
+    def _add_adapter(self: Any, *args: Any, **kwargs: Any) -> Any:
+        boundaries = {}
+        for getter in (self.get_input_embeddings, self.get_output_embeddings):
+            wrapper = getter()
+            if isinstance(wrapper, _streamed_large_layer_class()):
+                boundaries[id(wrapper)] = (wrapper, [])
+        seen = set()
+        stack = [self]
+        while stack:
+            parent = stack.pop()
+            if id(parent) in seen:
+                continue
+            seen.add(id(parent))
+            for name, child in parent._modules.items():
+                if id(child) in boundaries:
+                    boundaries[id(child)][1].append((parent, name))
+                elif child is not None:
+                    stack.append(child)
+        for wrapper, references in boundaries.values():
+            for parent, name in references:
+                parent._modules[name] = wrapper.inner
+        try:
+            return add_adapter(self, *args, **kwargs)
+        finally:
+            for wrapper, references in boundaries.values():
+                if not references:
+                    continue
+                parent, name = references[0]
+                inner = parent._modules[name]
+                wrapper.inner = inner
+                wrapper._weight_param_name = _large_layer_weight_param_name(inner)
+                for parent, name in references:
+                    parent._modules[name] = wrapper
+
+    model.add_adapter = MethodType(_add_adapter, model)
+    model.load_adapter = MethodType(_load_adapter, model)
+
+
 def canonical_named_parameters(model: Any) -> Iterator[Tuple[str, Any]]:
     """Yield ``(name, param)`` with any wrapper ``.inner.`` segment stripped,
     matching the spelling ``StreamedDecoderLayer.state_dict()`` uses (v0.72.1).
@@ -2145,9 +2827,9 @@ def sm_clock_mhz() -> Optional[int]:
 
     from soup_cli.utils.layer_stream import _resolve_tool
 
-    # Absolute path, never the bare name: on Windows CreateProcess searches the
-    # CURRENT DIRECTORY before PATH, so a planted nvidia-smi.exe in a cloned
-    # project would run instead of the real one (CWE-427).
+    # Run by the absolute path found in an absolute PATH directory, never by the
+    # bare name: on Windows a bare name is looked up in the current directory
+    # before PATH, so the nvidia-smi run would depend on where soup was started.
     tool = _resolve_tool("nvidia-smi")
     if tool is None:
         return None
@@ -2442,9 +3124,13 @@ def expandable_segments_status() -> tuple[bool, str]:
     if not torch.cuda.is_available():
         return (False, "no CUDA device")
     if torch.cuda.is_initialized():
-        already = "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        if already:
+        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments:True" in conf:
             return (True, "")
+        if conf:
+            # ``soup train`` sets the hint before CUDA starts (#2149), with setdefault,
+            # so a value the user exported is what kept it out, not the ordering.
+            return (False, "PYTORCH_CUDA_ALLOC_CONF is set to something else")
         return (
             False,
             "CUDA was already initialised before Soup could set it — the "
@@ -2545,37 +3231,54 @@ def _drop_fp8_source_quantization(config: Any) -> None:
         del config.quantization_config
 
 
-def build_meta_skeleton(
-    model_id: str,
-    *,
-    dtype: str,
-    quant: str = "none",
-    double_quant: bool = True,
-    trust_remote_code: bool = False,
-):
-    """Build the model structure on ``meta``: no weight storage is allocated.
+#: A CPU tensor-factory request of this many bytes or more is made on ``meta`` while the
+#: skeleton is built (#2154). Smaller requests stay real, so the small buffers
+#: (rotary ``inv_freq``, ``e_score_correction_bias``) keep their ``__init__`` values.
+SKELETON_META_REDIRECT_BYTES = 1 << 20
 
-    Under ``quant='nf4'`` the decoder linears are replaced with
-    ``bnb.nn.Linear4bit`` (still on ``meta``) so the streamed ``Params4bit``
-    views land in modules that know how to consume them.
+_SKELETON_FACTORIES = ("empty", "zeros", "ones", "full", "empty_strided")
+
+
+@contextlib.contextmanager
+def _large_cpu_requests_on_meta(threshold: int) -> Iterator[None]:
+    """Make every CPU factory request of ``threshold`` bytes or more on ``meta``.
+
+    ``init_empty_weights()`` moves a parameter to ``meta`` only after it is registered,
+    and a fused-expert MoE builds its parameter with ``torch.empty(num_experts,
+    2 * intermediate, hidden)`` first: 22.5 GB of commit per layer for Kimi K2, never
+    touched, but charged (#2154). Redirecting the request itself is what avoids it.
+
+    A ``TorchFunctionMode``, not a patch of the ``torch`` module: torch caches the
+    factories that ``with torch.device(...)`` applies to the first time a device context
+    is used, and a patched module seen then (``replace_with_bnb_linear`` opens one under
+    ``nf4``) would stay in that cache for the rest of the process. The mode also applies
+    to this thread only, and it ends with the build however the build ends.
     """
+    import torch
+    from torch.overrides import TorchFunctionMode
+
+    class _Redirect(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if getattr(func, "__name__", None) in _SKELETON_FACTORIES and "out" not in kwargs:
+                device = kwargs.get("device")
+                target = torch.device(device if device is not None else torch.get_default_device())
+                if target.type == "cpu":
+                    probe = func(*args, **{**kwargs, "device": "meta"})
+                    if probe.numel() * probe.element_size() >= threshold:
+                        return probe
+            return func(*args, **kwargs)
+
+    with _Redirect():
+        yield
+
+
+def _skeleton_from_config(
+    config: Any, torch_dtype: Any, quant_config: Any, trust_remote_code: bool
+) -> Any:
     from accelerate import init_empty_weights
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM
 
-    from soup_cli.utils.layer_shard import QUANT_NF4, SUPPORTED_STREAM_QUANTS
-
-    if quant not in SUPPORTED_STREAM_QUANTS:
-        raise ValueError(
-            f"unsupported quant {quant!r} for layer streaming; supported: "
-            f"{', '.join(SUPPORTED_STREAM_QUANTS)}"
-        )
-    torch_dtype = _torch_dtype(dtype)
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-    config.use_cache = False
-    _drop_fp8_source_quantization(config)
-    quant_config = None
-    if quant == QUANT_NF4:
-        quant_config = build_nf4_config(dtype, double_quant=double_quant)
     with init_empty_weights():
         # Keep the model-construction spelling aligned with the load-site
         # compatibility guard in tests/test_transformers_floor_compat.py.
@@ -2593,6 +3296,61 @@ def build_meta_skeleton(
                 modules_to_not_convert=["lm_head"],
                 quantization_config=quant_config,
             )
+    return model
+
+
+def build_meta_skeleton(
+    model_id: str,
+    *,
+    dtype: str,
+    quant: str = "none",
+    double_quant: bool = True,
+    trust_remote_code: bool = False,
+):
+    """Build the model structure on ``meta``: no weight storage is allocated.
+
+    Under ``quant='nf4'`` the decoder linears are replaced with
+    ``bnb.nn.Linear4bit`` (still on ``meta``) so the streamed ``Params4bit``
+    views land in modules that know how to consume them.
+
+    Large CPU requests are made on ``meta`` during the build
+    (:func:`_large_cpu_requests_on_meta`). A buffer has to stay real, so if one
+    that large comes out on ``meta`` the model is built again without the
+    redirect, as before #2154, and the buffer is named.
+    """
+    from soup_cli.utils.kimi_k2 import load_stream_model_config
+    from soup_cli.utils.layer_shard import QUANT_NF4, SUPPORTED_STREAM_QUANTS
+    from soup_cli.utils.run_provenance import base_revision_kwargs
+
+    if quant not in SUPPORTED_STREAM_QUANTS:
+        raise ValueError(
+            f"unsupported quant {quant!r} for layer streaming; supported: "
+            f"{', '.join(SUPPORTED_STREAM_QUANTS)}"
+        )
+    torch_dtype = _torch_dtype(dtype)
+    # AutoConfig's config, or for Kimi K2 the guarded native one (utils/kimi_k2.py); both
+    # reads pinned to the run's bound base commit (#2094).
+    config = load_stream_model_config(
+        model_id, trust_remote_code=trust_remote_code, **base_revision_kwargs(model_id),
+    )
+    config.use_cache = False
+    _drop_fp8_source_quantization(config)
+    quant_config = None
+    if quant == QUANT_NF4:
+        quant_config = build_nf4_config(dtype, double_quant=double_quant)
+    with _large_cpu_requests_on_meta(SKELETON_META_REDIRECT_BYTES):
+        model = _skeleton_from_config(config, torch_dtype, quant_config, trust_remote_code)
+    meta_buffers = [name for name, buffer in model.named_buffers() if buffer.is_meta]
+    if meta_buffers:
+        logger.warning(
+            "%s registers a buffer of %d bytes or more (%s), which must hold real "
+            "values; building its skeleton without the meta redirect, so its large "
+            "parameters are allocated on the CPU before they move to meta",
+            type(model).__name__,
+            SKELETON_META_REDIRECT_BYTES,
+            ", ".join(meta_buffers),
+        )
+        model = _skeleton_from_config(config, torch_dtype, quant_config, trust_remote_code)
     # ``from_config`` does not reliably preserve the source reference that
     # ``from_pretrained`` stamps on both the model and its config.  PEFT reads
     # ``model.__dict__["name_or_path"]`` while wrapping LoRA and copies it to
@@ -2733,8 +3491,10 @@ def materialize_meta_adapters(model: Any, *, seed: int = 0, device: str = "cuda"
             if not param.is_meta or "lora_" not in full:
                 continue
             data = torch.empty(param.shape, dtype=torch.float32)
-            if "lora_B" in full:
+            if "lora_embedding_A" in full or "lora_B" in full:
                 data.zero_()
+            elif "lora_embedding_B" in full:
+                nn.init.normal_(data, generator=generator)
             else:
                 nn.init.kaiming_uniform_(data, a=5**0.5, generator=generator)
             module._parameters[pname] = nn.Parameter(data.to(device), requires_grad=True)
@@ -2871,9 +3631,16 @@ def materialize_meta_adapter_copy(
     copied = 0
 
     for target_name, target_param in list(parameters.items()):
-        if target_marker not in target_name or not target_param.is_meta:
+        # Linear adapters have .ref.weight; embedding adapters are parameters
+        # in a ParameterDict and end with .ref instead.
+        has_target = target_marker in target_name or target_name.endswith("." + target_adapter)
+        if not has_target or not target_param.is_meta:
             continue
-        source_name = target_name.replace(target_marker, source_marker, 1)
+        source_name = (
+            target_name.replace(target_marker, source_marker, 1)
+            if target_marker in target_name
+            else target_name[: -len(target_adapter)] + source_adapter
+        )
         source_param = parameters.get(source_name)
         if source_param is None:
             raise RuntimeError(
@@ -2889,7 +3656,9 @@ def materialize_meta_adapter_copy(
         copied += 1
 
     stranded = [
-        name for name, param in model.named_parameters() if target_marker in name and param.is_meta
+        name
+        for name, param in model.named_parameters()
+        if (target_marker in name or name.endswith("." + target_adapter)) and param.is_meta
     ]
     if stranded:
         raise RuntimeError(
@@ -3353,21 +4122,34 @@ def install_streaming(
             if embed_key != output_key:
                 raise ValueError("one module cannot represent two untied large-layer weights")
             shared = large_cls(
-                input_module, embed_key, large_pool, refill_before_backward=refill_before_backward
+                input_module,
+                embed_key,
+                large_pool,
+                refill_before_backward=refill_before_backward,
+                weight_path=large_shard_path(shard_dir, embed_key),
             )
             if not _replace_module_references(model, input_module, shared):
                 raise RuntimeError("could not install the streamed tied embedding module")
         else:
             streamed_input = large_cls(
-                input_module, embed_key, large_pool, refill_before_backward=refill_before_backward
+                input_module,
+                embed_key,
+                large_pool,
+                refill_before_backward=refill_before_backward,
+                weight_path=large_shard_path(shard_dir, embed_key),
             )
             streamed_output = large_cls(
-                output_module, output_key, large_pool, refill_before_backward=refill_before_backward
+                output_module,
+                output_key,
+                large_pool,
+                refill_before_backward=refill_before_backward,
+                weight_path=large_shard_path(shard_dir, output_key),
             )
             if not _replace_module_references(model, input_module, streamed_input):
                 raise RuntimeError("could not install the streamed input embedding")
             if not _replace_module_references(model, output_module, streamed_output):
                 raise RuntimeError("could not install the streamed output head")
+        _attach_streamed_boundary_adapter_bridge(model)
 
     def _prime(*_args: Any, **_kwargs: Any) -> None:
         # #975 — the backward-tail prefetch above already loads this for every
@@ -3823,8 +4605,8 @@ def build_streamed_model(
         from soup_cli.utils.peft_wiring import apply_pre_lora_patches
 
         apply_pre_lora_patches(model, model_id)
+        _refuse_trainable_streamed_boundary(model, index, lora_config)
         model = get_peft_model(model, lora_config)
-        _refuse_lora_on_streamed_boundary(model, index, lora_config)
         materialize_meta_adapters(model, seed=seed, device=device)
         assert_trainable_adapters_materialized(model)
         runtime = install_streaming(

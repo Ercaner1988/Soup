@@ -172,6 +172,13 @@ def sweep(
             _set_nested_param(probe, key, val)
         try:
             _reject_unknown_sweep_params(probe)
+            # Values differ between arms, so a staged field is looked for in
+            # every combination, not only the first (#808).
+            for combo in combinations:
+                arm = base_cfg.model_dump()
+                for key, val in combo.items():
+                    _set_nested_param(arm, key, val)
+                _reject_staged_sweep_params(arm)
         except ValueError as exc:
             console.print(f"[red]{exc}[/]")
             raise typer.Exit(1) from exc
@@ -357,6 +364,11 @@ def _generate_combinations(
     if strategy == "grid":
         combos = [dict(zip(keys, vals)) for vals in itertools.product(*value_lists)]
     elif strategy == "random":
+        # Draw from each list's distinct values. A list that names a value twice
+        # (`lr=1e-5,2e-5,1e-5`, or `1e-5,0.00001`) has fewer distinct arms than the
+        # product of the list lengths; sampling until that many unique arms turned
+        # up never finished, and the run-them-all branch repeated an arm.
+        value_lists = [list(dict.fromkeys(vals)) for vals in value_lists]
         total_possible = 1
         for vals in value_lists:
             total_possible *= len(vals)
@@ -470,6 +482,31 @@ def _reject_unknown_sweep_params(config_dict: dict) -> None:
         raise ValueError(f"sweep parameter does not match any config field: {detail}")
 
 
+def _reject_staged_sweep_params(config_dict: dict) -> None:
+    """Refuse a sweep whose parameter sets a staged field away from its default (#808).
+
+    ``soup train`` refuses such a field at load (``config/loader.py``), but a
+    ``--param`` value is applied after the load, to a ``model_dump()``, and would
+    otherwise reach ``SoupConfig(**config_dict)`` unchecked. Follows the loader's
+    ``STAGED_FIELD_SEVERITY``: under ``"warn"`` nothing is refused here either.
+    """
+    from soup_cli.config import loader
+    from soup_cli.config.staged_fields import (
+        STAGED_FIELD_REJECTION_VERSION,
+        find_staged_config_fields,
+    )
+
+    if loader.STAGED_FIELD_SEVERITY != "error":
+        return
+    staged = find_staged_config_fields(config_dict)
+    if staged:
+        paths = ", ".join(item.path for item in staged)
+        raise ValueError(
+            f"sweep parameter sets a field that is accepted but read by nothing: {paths}; "
+            f"refused as of v{STAGED_FIELD_REJECTION_VERSION}. Remove it from --param."
+        )
+
+
 def _run_single(base_cfg, params: dict, run_name: str, config_path: Path) -> dict:
     """Run a single training with modified parameters."""
     # Deep copy and modify config
@@ -484,6 +521,7 @@ def _run_single(base_cfg, params: dict, run_name: str, config_path: Path) -> dic
     # without the training stack. `sweep()` pre-checks the grid too; this stays
     # so a direct caller cannot bypass it.
     _reject_unknown_sweep_params(config_dict)
+    _reject_staged_sweep_params(config_dict)
 
     from soup_cli.config.schema import SoupConfig
     from soup_cli.data.loader import (
@@ -513,6 +551,10 @@ def _run_single(base_cfg, params: dict, run_name: str, config_path: Path) -> dic
         preserve_source_columns=task_preserves_source_columns(cfg.task),
     )
     console.print(f"[dim]Loaded {len(dataset['train'])} train samples[/]")
+    # #2047 -- the judge_rank cost guard, between the data load and the model load.
+    from soup_cli.trainer.grpo_judge import check_judge_rank_budget
+
+    check_judge_rank_budget(cfg, dataset)
 
     # Start tracking
     tracker = ExperimentTracker()

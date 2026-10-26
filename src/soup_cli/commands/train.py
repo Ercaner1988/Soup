@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -25,6 +26,7 @@ from soup_cli.data.loader import (
 from soup_cli.monitoring.display import TrainingDisplay
 from soup_cli.trainer.classifier import CLASSIFICATION_TASKS
 from soup_cli.utils.gpu import (
+    configure_cuda_alloc_hint,
     configure_mps_async_load,
     detect_device,
     get_gpu_info,
@@ -38,33 +40,9 @@ if TYPE_CHECKING:  # pragma: no cover - type hints only, no runtime import
 logger = logging.getLogger(__name__)
 console = Console()
 
-# Optimizers the analytical hardware-fit predictor understands (mirror of
-# hardware_fit._VALID_OPTIMIZERS); an unknown optimizer maps to the
-# highest-state default so the estimate stays conservative.
-_HW_FIT_OPTIMIZERS = frozenset({
-    "adamw_torch", "adamw_torch_fused", "adafactor", "sgd",
-    "adamw_bnb_8bit", "paged_adamw_8bit", "lion_8bit",
-    "lomo", "adalomo", "schedule_free_adamw",
-})
-
-# training.quantization -> the hardware-fit predictor's name for it. A value
-# that is not here (``hqq:*``) has no memory model, and the pre-flight says it
-# skipped the run (#1652).
-_HW_FIT_QUANT = {
-    "none": "none",
-    "4bit": "4bit",
-    "8bit": "8bit",
-    # Stay packed on the card.
-    "gptq": "gptq",
-    "awq": "awq",
-    "aqlm": "aqlm",
-    "eetq": "eetq",
-    # Dequantized on load, so priced (and gated) like "none" (#1631, #1652).
-    "mxfp4": "mxfp4",
-    "fp8": "fp8",
-}
-
-# The formats above that train in bf16, and how the gate's panel names them.
+# The quantizations the pre-flight prices but trains in bf16 (dequantized on
+# load), and how the gate's panel names them. The quantization and optimizer
+# tables live with the shared estimate in utils/hardware_fit.py (#2049).
 _HW_FIT_DEQUANTIZED_ON_LOAD = {"mxfp4": "MXFP4", "fp8": "FP8"}
 
 _UNWIRED_TRAINING_TUNABLES = (
@@ -72,9 +50,14 @@ _UNWIRED_TRAINING_TUNABLES = (
     # checkpoint_eval_steps, checkpoint_eval_metric, checkpoint_eval_tasks,
     # checkpoint_keep_top, convergence_window, convergence_rel_tol) moved to
     # config/staged_fields.py (#808), and early_stop_patience moved in #761:
-    # the loader warns about them with the refusal date, so they are not listed here.
+    # the loader refuses them (config/staged_fields.py), so they are not listed here.
     "forgetting_threshold",
 )
+
+
+def _stdin_isatty() -> bool:
+    """True when standard input is an interactive terminal."""
+    return sys.stdin.isatty()
 
 
 def _nondefault_unwired_training_settings(training_config) -> list[str]:
@@ -99,6 +82,19 @@ def _nondefault_unwired_training_settings(training_config) -> list[str]:
 
 
 UNSUPPORTED_RESUME_TASKS: frozenset[str] = frozenset({"unlearn"})
+
+
+def _resume_refusal(cfg: "SoupConfig", flag: str) -> str | None:
+    """Why ``flag`` (``--resume`` / ``--hf-resume``) cannot run for ``cfg``, or None."""
+    if cfg.task in UNSUPPORTED_RESUME_TASKS:
+        return f"{flag} is not supported for task {cfg.task!r}"
+    if cfg.task == "grpo" and cfg.backend == "mlx":
+        # #1976: the native MLX GRPO loop saves the adapter only. The message
+        # lives with the trainer (imported lazily: it pulls in mlx-free code only).
+        from soup_cli.trainer.mlx_grpo import RESUME_REFUSAL
+
+        return RESUME_REFUSAL.replace("--resume", flag, 1)
+    return None
 
 
 def _format_training_complete_loss(result: dict) -> str:
@@ -333,46 +329,35 @@ def _refuse_empty_train(dcfg, dataset) -> None:
     raise typer.Exit(1)
 
 
-def _build_hardware_fit_input(cfg):
+def _refuse_over_judge_budget(cfg, dataset) -> None:
+    """Refuse a ``judge_rank`` run that could exceed its judge-call budget (#2047).
+
+    The rows are known only once the dataset is loaded, and the trainer loads
+    the model before it reads them, so this runs between the two.
+    """
+    from rich.markup import escape
+
+    from soup_cli.trainer.grpo_judge import check_judge_rank_budget
+
+    try:
+        check_judge_rank_budget(cfg, dataset)
+    except ValueError as exc:
+        console.print(f"[red]Judge budget:[/] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+
+
+def _build_hardware_fit_input(cfg, gpu_memory_gb=None):
     """Best-effort ``HardwareFitInput`` from a ``SoupConfig``.
 
     Returns ``None`` when the run is not statically predictable (batch_size
-    ``"auto"``, unknown model size, unsupported quant, out-of-range dims), in
-    which case the caller skips the gate rather than guess.
+    ``"auto"``, unsupported quant, out-of-range dims), in which case the caller
+    skips the gate rather than guess. Built by the shared
+    ``hardware_fit_input_from_config``, as ``soup profile``'s input is (#2049).
+    ``gpu_memory_gb`` (GiB) resolves ``gradient_checkpointing: auto``.
     """
-    from soup_cli.utils.gpu import model_size_from_name
-    from soup_cli.utils.hardware_fit import HardwareFitInput, resolve_peft_mode
+    from soup_cli.utils.hardware_fit import hardware_fit_input_from_config
 
-    tcfg = cfg.training
-    bs = getattr(tcfg, "batch_size", None)
-    if not isinstance(bs, int) or isinstance(bs, bool):
-        return None  # "auto" resolves later — can't predict yet
-    params_b = model_size_from_name(getattr(cfg, "base", "") or "")
-    if not isinstance(params_b, (int, float)) or params_b <= 0:
-        return None
-    seq_len = getattr(cfg.data, "max_length", None)
-    if not isinstance(seq_len, int) or isinstance(seq_len, bool):
-        return None
-    quant = _HW_FIT_QUANT.get(str(getattr(tcfg, "quantization", "none") or "none"))
-    if quant is None:
-        return None
-    peft = resolve_peft_mode(cfg, quant=quant)
-    optimizer = str(getattr(tcfg, "optimizer", "adamw_torch") or "adamw_torch")
-    if optimizer not in _HW_FIT_OPTIMIZERS:
-        optimizer = "adamw_torch"
-    gc = bool(getattr(tcfg, "gradient_checkpointing", False))
-    try:
-        return HardwareFitInput(
-            params_b=float(params_b),
-            seq_len=int(seq_len),
-            batch_size=int(bs),
-            optimizer=optimizer,
-            quant=quant,
-            peft=peft,
-            gradient_checkpointing=gc,
-        )
-    except (ValueError, TypeError):
-        return None  # dims out of the predictor's supported range
+    return hardware_fit_input_from_config(cfg, gpu_memory_gb=gpu_memory_gb)
 
 
 def _hardware_fit_preflight(cfg, gpu_info, *, allow_oom_attempt: bool) -> None:
@@ -405,10 +390,13 @@ def _hardware_fit_preflight(cfg, gpu_info, *, allow_oom_attempt: bool) -> None:
         return
     if total_bytes <= 0:
         return  # no CUDA VRAM to predict against
-    inp = _build_hardware_fit_input(cfg)
+    from soup_cli.utils.hardware_fit import CONFIG_QUANT_TO_FIT
+
+    # The card in GiB, as trainer/sft.py reads it to resolve `auto` checkpointing.
+    inp = _build_hardware_fit_input(cfg, gpu_memory_gb=total_bytes / 1024**3)
     if inp is None:
         quantization = str(getattr(cfg.training, "quantization", "none") or "none")
-        if quantization not in _HW_FIT_QUANT:
+        if quantization not in CONFIG_QUANT_TO_FIT:
             # #1652: silence here read as "fits".
             console.print(
                 "[yellow]Pre-flight skipped:[/] no memory model for "
@@ -429,6 +417,23 @@ def _hardware_fit_preflight(cfg, gpu_info, *, allow_oom_attempt: bool) -> None:
         if dequantized
         else ""
     )
+    # #2049: the terms the old formula did not have, shown when they count.
+    extra = "".join(
+        f" | {label} {value:.1f}"
+        for label, value in (
+            ("adapters", b.adapters_gb),
+            ("logits", b.logits_gb),
+            ("dequant", b.dequant_gb),
+        )
+        if value >= 0.05
+    )
+    # What the estimate had to guess goes after the advice, so the numbers and the
+    # advice keep their layout (#1631).
+    footnote = (
+        "".join(f"\n[dim]{markup_escape(line)}[/]" for line in b.estimate.notes)
+        if b.estimate is not None
+        else ""
+    )
     tail = (
         "[yellow]--allow-oom-attempt set: launching anyway.[/]"
         if allow_oom_attempt
@@ -442,8 +447,8 @@ def _hardware_fit_preflight(cfg, gpu_info, *, allow_oom_attempt: bool) -> None:
             f"{report.required_with_margin_gb:.1f} GB) exceeds "
             f"{report.available_vram_gb:.1f} GB available.\n"
             f"weights {b.weights_gb:.1f} | optim {b.optimizer_gb:.1f} | "
-            f"grads {b.gradients_gb:.1f} | activations {b.activations_gb:.1f} "
-            f"| overhead {b.overhead_gb:.1f} GB\n" + note + "\n" + tail,
+            f"grads {b.gradients_gb:.1f} | activations {b.activations_gb:.1f}"
+            f"{extra} | overhead {b.overhead_gb:.1f} GB\n" + note + "\n" + tail + footnote,
             title=(
                 "[yellow]Hardware-fit warning[/]"
                 if allow_oom_attempt
@@ -678,7 +683,10 @@ def train(
         False,
         "--yes",
         "-y",
-        help="Skip confirmation prompt",
+        help=(
+            "Skip the start-training confirmation. Required when stdin is "
+            "not a TTY (scripts, CI, pipes)."
+        ),
     ),
     trust_remote_code: bool = typer.Option(
         False,
@@ -1141,8 +1149,9 @@ def train(
     if hf_resume and not push_as:
         console.print("[red]--hf-resume requires --push-as <repo>[/]")
         raise typer.Exit(1)
-    if hf_resume and cfg.task in UNSUPPORTED_RESUME_TASKS:
-        console.print(f"[red]--hf-resume is not supported for task {cfg.task!r}[/]")
+    hf_refusal = _resume_refusal(cfg, "--hf-resume") if hf_resume else None
+    if hf_refusal:
+        console.print(f"[red]{hf_refusal}[/]")
         raise typer.Exit(1)
 
     # --- Eval-gate shortcut: --gate <path> sets training.eval_gate ---
@@ -1464,6 +1473,9 @@ def train(
                 ).items():
                     os.environ.setdefault(key, val)
 
+    # Before detect_device, which creates the CUDA context the allocator reads it at (#2149).
+    configure_cuda_alloc_hint(cfg.training.stream_layers)
+
     # Detect hardware with backend awareness
     device, device_name = detect_device(backend=cfg.backend)
     gpu_info = get_gpu_info(backend=cfg.backend)
@@ -1723,6 +1735,18 @@ def train(
             raise typer.Exit(1) from exc
 
     if not dry_run and not yes:
+        # #1913: on a non-TTY stdin the confirm can never be answered — a pipe
+        # hangs until its writer closes (EOF aborts via typer) and an
+        # unattended service waits forever. Fail with the escape hatch named.
+        from soup_cli.utils.exit_codes import EXIT_USAGE_ERROR
+
+        if not _stdin_isatty():
+            console.print(
+                "[red]stdin is not a TTY, so the start-training confirmation "
+                "cannot be answered.[/] Pass --yes to start without the "
+                "confirmation."
+            )
+            raise typer.Exit(EXIT_USAGE_ERROR)
         if not typer.confirm("Start training?", default=True):
             console.print("[yellow]Cancelled.[/]")
             raise typer.Exit()
@@ -1746,6 +1770,7 @@ def train(
         _refuse_empty_train(cfg.data, dataset)
         _validate_classification_dataset_if_applicable(cfg, dataset)
         _validate_csm_dataset_if_applicable(cfg, dataset)
+        _refuse_over_judge_budget(cfg, dataset)
         console.print(
             f"[green]Data OK:[/] {_train_sample_count(cfg.data, dataset)} train samples"
         )
@@ -1771,6 +1796,7 @@ def train(
     _refuse_empty_train(cfg.data, dataset)
     _validate_classification_dataset_if_applicable(cfg, dataset)
     _validate_csm_dataset_if_applicable(cfg, dataset)
+    _refuse_over_judge_budget(cfg, dataset)
     console.print(
         f"[green]Loaded:[/] {_train_sample_count(cfg.data, dataset)} train samples"
     )
@@ -1886,17 +1912,24 @@ def train(
         # to keep separate chains and sweep's copy fell ten tasks and the MLX
         # route behind. See soup_cli/trainer/dispatch.py.
         from soup_cli.trainer.dispatch import build_trainer
-        from soup_cli.utils.launcher import is_in_distributed
-        from soup_cli.utils.run_provenance import BaseRevision, base_revision_scope
+        from soup_cli.utils.run_provenance import (
+            BaseRevision,
+            base_revision_scope,
+            confirm_distributed_base_revision,
+            synchronize_base_revision,
+        )
 
         base_identity = BaseRevision(
             run_base,
-            binding_supported=(cfg.backend == "transformers" and hub_name == "hf"
-                               and not cfg.training.stream_layers and not is_in_distributed()),
+            binding_supported=(cfg.backend == "transformers" and hub_name == "hf"),
         )
+        synchronize_base_revision(base_identity, cpu=device == "cpu")
         with base_revision_scope(base_identity):
             trainer_wrapper = build_trainer(cfg, **trainer_kwargs)
             trainer_wrapper.setup(dataset)
+        confirm_distributed_base_revision(
+            base_identity, model=getattr(trainer_wrapper, "model", None),
+        )
         tracker.record_base_revision(
             run_id, revision=base_identity.revision, source=base_identity.source,
         )
@@ -2004,6 +2037,9 @@ def train(
 
         from soup_cli.utils.run_provenance import write_run_provenance
 
+        confirm_distributed_base_revision(
+            base_identity, model=getattr(trainer_wrapper, "model", None),
+        )
         tracker.record_base_revision(
             run_id, revision=base_identity.revision, source=base_identity.source,
         )
@@ -2076,7 +2112,9 @@ def train(
             f"{merge_hint}\n"
             f"Export GGUF: [bold]soup export --model {result['output_dir']}[/]\n"
             f"Run details: [bold]soup runs show {run_id}[/]",
-            title="[bold green]Training Complete![/]",
+            title=("[bold yellow]Training Stopped — Loss watchdog[/]"
+                   if result.get("stop_reason") == "loss_watchdog"
+                   else "[bold green]Training Complete![/]"),
         )
     )
 
@@ -2624,8 +2662,9 @@ def _resolve_resume_or_exit(resume: str, cfg: "SoupConfig") -> str | None:
     """
     if not resume:
         return None
-    if cfg.task in UNSUPPORTED_RESUME_TASKS:
-        console.print(f"[red]--resume is not supported for task {cfg.task!r}[/]")
+    refusal = _resume_refusal(cfg, "--resume")
+    if refusal:
+        console.print(f"[red]{refusal}[/]")
         raise typer.Exit(1)
     resume_from = _resolve_checkpoint(resume, cfg.output, cfg.experiment_name, backend=cfg.backend)
     if resume_from:

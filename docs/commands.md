@@ -36,6 +36,7 @@ soup infer|chat|diff ... --device cpu|cuda|cuda:N|mps  Pick where the model load
 soup push --model ./output --repo user/name   Upload to HuggingFace
 soup push --model ./output --repo user/name --collection user/coll-abc123  Add to HF Collection
 soup merge --adapter ./output                 Merge LoRA with base model
+soup merge --adapter ./output --low-memory    Merge tensor by tensor without loading the whole model into RAM
 soup merge --adapter ./output --save-format 4bit --no-double-quant  Save a BNB-4bit merge with double-quantization disabled (default on; #321)
 soup merge-sharded-fsdp-weights ./shards -o merged.safetensors  Consolidate FSDP shards into one safetensors (v0.71.14; --plan-only previews)
 soup delinearize-llama4 ./src --target ./out [--num-experts N] [--plan-only]  Live Llama-4 fused-expert reshape [E*din,dout] -> [E,din,dout] + sidecar copy (v0.71.21)
@@ -46,8 +47,6 @@ soup export --model ./output --format gguf    Export to GGUF (Ollama)
 soup export --model ./output --deploy ollama  Export GGUF + auto-deploy to Ollama
 soup export --model ./output --format onnx    Export to ONNX
 soup export --model ./output --format tensorrt  Export to TensorRT-LLM
-soup export --model ./output --format awq --calibration-data cal.jsonl  Export to AWQ (4-bit; deprecated, removed in Soup v0.77)
-soup export --model ./output --format gptq --calibration-data cal.jsonl  Export to GPTQ (4-bit; deprecated, removed in Soup v0.77)
 soup export --model ./output --format gguf --verbose  Show export phases and stream converter/quantizer logs while they run (#1760)
 soup export --model ./output --format gguf --no-install-deps  Never invoke pip; refuse missing conversion packages before merge/toolchain work (#1760)
 soup deploy ollama --model m.gguf --name x    Deploy GGUF to Ollama
@@ -146,7 +145,7 @@ soup data push --input d.jsonl --hf-dataset u/n --hub modelscope|modelers  Uploa
 soup data registry                           List all registered datasets
 soup data demo                                List bundled demo JSONL fixtures
 soup data demo alpaca_demo --output ./d.jsonl  Copy a bundled demo JSONL fixture
-soup data ingest <file>                         PDF/DOCX/MD/TXT -> JSONL (one row per page/heading)
+soup data ingest <file>                         PDF/DOCX/MD/TXT -> JSONL (PDF/DOCX: pip install "soup-cli[documents]")
 soup data preprocess <config>                   AOT-tokenize and cache for reuse across runs
 soup data recipe <path>                         Validate / execute a Data Recipe DAG
 soup data mix                                 BETA mixture-weight optimiser (proxy runs)
@@ -175,7 +174,7 @@ soup adapters checkout <name>                   Restore a snapshotted branch's c
 soup adapters diff <a> <b>                      Per-layer ΔW Frobenius diff + effective-rank drift
 soup loop init <model> --eval <s> --baseline <b> [--pre-wired] [--thumbs-db <db>]  Create .soup/loop.yaml (data flywheel; --pre-wired = real stages; --thumbs-db = harvest `serve --record-thumbs` thumbs)
 soup loop status                              Counters + status + pre_wired flag
-soup loop watch [--detach] [--max-iterations N] [--pre-wired] [--pack-cans]  Harvest → train → gate → deploy daemon (pre-wired stages + Soup Can packing)
+soup loop watch [--detach] [--max-iterations N] [--pre-wired] [--pack-cans] [--tool-auth-token T]  Harvest → train → gate → deploy daemon (pre-wired stages + Soup Can packing)
 soup loop pause                              Atomic status flip: pause watch daemon at next iteration boundary
 soup loop resume                             Atomic status flip: resume a paused loop
 soup loop canary <adapter> --traffic 5%      Route keyed serve traffic to a loaded adapter; watch auto-rolls back on MAJOR
@@ -185,7 +184,7 @@ soup migrate --from llamafactory config.yaml  Import config from LLaMA-Factory
 soup migrate --from axolotl config.yml        Import config from Axolotl
 soup migrate --from unsloth notebook.ipynb    Import config from Unsloth notebook
 soup migrate --from llamafactory c.yaml --dry-run  Preview without writing
-soup recipes list                             List all 169 ready-made recipes
+soup recipes list                             List all 171 ready-made recipes
 soup recipes show llama3.1-8b-sft            Print recipe YAML
 soup recipes use llama3.1-8b-sft             Copy recipe to soup.yaml
 soup recipes search "reasoning"              Search by keyword/task/size
@@ -220,6 +219,7 @@ soup why [run_id]                             Explain training anomalies (heuris
 soup rewind [run_id] [--step N]               Name the dataset rows behind a loss spike
 soup ship --base <m> --adapter <lora> --task-eval t.jsonl  SHIP / DON'T-SHIP verdict: task win AND no regression on the bundled suite (exit 0=SHIP / 2=DON'T / 3=usage / 1=runtime) (v0.71.25; leg-2 real + usage-off-2 v0.71.38)
 soup ship --evidence ev.json [--output v.json]  Decide offline from pre-computed scores (no model load)
+soup ship ... --progress jsonl  Emit versioned completion events on stderr; keep the verdict on stdout (#1759)
 soup ship ... --task-mode judge_score --judge-model ollama://llama3.1  Leg-1 via LLM-as-a-judge
 soup ship ... --task-mode pairwise --judge-model ollama://llama3.1  Leg-1 via swap-debiased judge win-rate (base=0.5) (v0.71.31)
 soup ship ...  # leg-2 default = 8 bundled offline suites (MCQ/arithmetic/over_refusal + tool_call/format_json/safety, extraction scorer, ~40 items each) (v0.71.38; +mini_over_refusal v0.73.2)
@@ -383,6 +383,7 @@ soup train  # task in {sft,tts} + train_router_only=true [+moe_lora]  Freeze MoE
 soup train  # quantization='bitnet_1.58'  BitNet 1.58 training is not implemented; config load refuses it
 soup export --model ./output --format bitnet|tq1_0  BitNet 1.58 TQ1_0 ternary GGUF via llama.cpp — LIVE (v0.71.20)
 soup version [--full] [--json]                Show version (--full: system info, --json: JSON output)
+soup --version                                Show version (prints the same text as soup version)
 soup --verbose <command>                      Full traceback on errors
 ```
 

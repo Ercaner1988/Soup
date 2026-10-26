@@ -225,7 +225,10 @@ def test_dry_run_does_not_capture_training_identity(tmp_path, monkeypatch):
     capture.assert_not_called()
 
 
-@pytest.mark.parametrize("mode", ["bound", "offline", "distributed", "non-hf"])
+@pytest.mark.parametrize("mode", [
+    "bound", "streaming", "unsloth", "offline", "distributed", "non-hf",
+    "distributed-setup", "distributed-late",
+])
 @pytest.mark.parametrize("source_state", ["unchanged", "changed", "deleted"])
 def test_train_cli_records_identity_and_writes_final_artifact(
     tmp_path, monkeypatch, moving_hub, mode, source_state,
@@ -244,6 +247,17 @@ def test_train_cli_records_identity_and_writes_final_artifact(
     monkeypatch.setattr("soup_cli.utils.gpu.detect_device", lambda: ("cpu", "CPU"))
     monkeypatch.setattr("soup_cli.utils.gpu.get_gpu_info", lambda: {})
     alternate_snapshot = None
+    bound = mode in {"bound", "streaming"} or mode.startswith("distributed")
+    if mode.startswith("distributed"):
+        import accelerate
+        import accelerate.utils
+
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setattr(accelerate, "PartialState", lambda **kwargs: SimpleNamespace(
+            num_processes=2, is_main_process=True,
+        ))
+        monkeypatch.setattr(accelerate.utils, "broadcast_object_list", lambda values, **kw: values)
+        monkeypatch.setattr(accelerate.utils, "gather_object", lambda values: values * 2)
 
     def alternate_hub(hub, model_id, *, local_dir):
         nonlocal alternate_snapshot
@@ -261,17 +275,21 @@ def test_train_cli_records_identity_and_writes_final_artifact(
         '{"instruction":"hi", "output":"hello"}\n', encoding="utf-8",
     )
     (tmp_path / "soup.yaml").write_text(
-        f"base: {BASE}\ndata: {{train: data.jsonl, format: alpaca, val_split: 0}}\n"
+        f"base: {BASE}\nbackend: {'unsloth' if mode == 'unsloth' else 'transformers'}\n"
+        "data: {train: data.jsonl, format: alpaca, val_split: 0}\n"
         "training: {epochs: 1, quantization: none, batch_size: 1, "
+        f"stream_layers: {str(mode == 'streaming').lower()}, "
         f"hub: {'modelscope' if mode == 'non-hf' else 'hf'}}}\noutput: final\n",
         encoding="utf-8",
     )
     import hashlib
 
     stored_hash = hashlib.sha256((tmp_path / "data.jsonl").read_bytes()).hexdigest()
-    expected = {"revision": REVISION} if mode == "bound" else {}
+    expected = {"revision": REVISION} if bound else {}
 
     class Trainer:
+        model = SimpleNamespace(config=SimpleNamespace(_commit_hash=None))
+
         def setup(self, dataset):
             assert dataset["train"]
             tracker = ExperimentTracker(tmp_path / "runs.db")
@@ -280,9 +298,15 @@ def test_train_cli_records_identity_and_writes_final_artifact(
             finally:
                 tracker.close()
             assert provenance.base_revision_kwargs(BASE) == expected
+            if mode == "distributed-setup":
+                self.model.config._commit_hash = "b" * 40
 
         def train(self, **kwargs):
-            assert provenance.base_revision_kwargs(BASE) == expected
+            assert provenance.base_revision_kwargs(BASE) == (
+                {} if mode == "distributed-setup" else expected
+            )
+            if mode == "distributed-late":
+                self.model.config._commit_hash = "b" * 40
             if source_state == "changed":
                 (tmp_path / "data.jsonl").write_text("later bytes", encoding="utf-8")
             elif source_state == "deleted":
@@ -293,6 +317,8 @@ def test_train_cli_records_identity_and_writes_final_artifact(
 
     def build(cfg, **kwargs):
         assert cfg.base == (alternate_snapshot if mode == "non-hf" else BASE)
+        if mode.startswith("distributed"):
+            moving_hub.assert_called_once()
         return Trainer()
 
     monkeypatch.setattr("soup_cli.trainer.dispatch.build_trainer", build)
@@ -303,15 +329,19 @@ def test_train_cli_records_identity_and_writes_final_artifact(
     assert row["status"] == "completed"
     assert row["base_model"] == BASE
     assert json.loads(row["config_json"])["base"] == BASE
-    assert row["base_revision"] == (REVISION if mode == "bound" else None)
+    assert row["base_revision"] == (
+        REVISION if bound and mode not in {"distributed-setup", "distributed-late"} else None
+    )
     assert row["base_revision_source"] == {
-        "bound": "hub_commit", "offline": "offline", "distributed": "unsupported_backend",
+        "bound": "hub_commit", "streaming": "hub_commit", "unsloth": "unsupported_backend",
+        "offline": "offline", "distributed": "hub_commit",
+        "distributed-setup": "unsupported_backend", "distributed-late": "unsupported_backend",
         "non-hf": "unsupported_backend",
     }[mode]
     metadata = provenance.read_run_provenance(output)
     assert metadata["run_id"] == row["run_id"]
     assert metadata["base_revision"] == row["base_revision"]
     assert metadata["training_data_sha256"] == stored_hash
-    assert moving_hub.call_count == (1 if mode == "bound" else 0)
+    assert moving_hub.call_count == (1 if bound else 0)
     assert provenance.base_revision_kwargs(BASE) == {}
     tracker.close()

@@ -76,13 +76,15 @@ class TestRecipeCatalog:
         assert results == []
 
     def test_all_recipes_valid_yaml(self):
-        """All recipes contain valid YAML that loads as SoupConfig."""
-        from soup_cli.config.loader import load_config_from_string
+        """Each recipe loads or refuses with its documented unavailability reason."""
         from soup_cli.recipes.catalog import RECIPES
+        from tests.recipe_contracts import load_catalog_config
 
         for name, recipe in RECIPES.items():
             try:
-                config = load_config_from_string(recipe.yaml_str)
+                config = load_catalog_config(recipe)
+                if config is None:
+                    continue
                 assert config.base is not None, f"Recipe {name} has no base model"
             except Exception as exc:
                 pytest.fail(f"Recipe '{name}' is invalid: {exc}")
@@ -1827,6 +1829,8 @@ class TestV025NewRecipes:
         PR #1113 removes spark-tts -> 173.
         Issue #1145 removed 3 (mistral-large-3-sft, mistral-large-3-dpo, minimax-m3-dpo) -> 170.
         Issue #1867 retires the unsupported vision-preference recipe -> 169.
+        Task-variant for #275 added 1 (qwen3.5-4b-dpo) -> 170.
+        Task-variant for #275 added 1 (qwen3.5-2b-dpo) -> 171.
         """
         from soup_cli.recipes.catalog import RECIPES
         from tests.recipe_count import EXPECTED_RECIPE_COUNT, recipe_count_hint

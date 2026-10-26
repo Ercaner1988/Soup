@@ -2,13 +2,14 @@
 
 [← Back to the Soup README](../README.md)
 
-> The OpenAI-compatible inference server, batch inference, benchmarking, merge/export (GGUF/ONNX/TensorRT/AWQ/GPTQ), the Anthropic Messages endpoint, speculative decoding, deploy autopilot, the Web UI, and Agent Forge.
+> The OpenAI-compatible inference server, batch inference, benchmarking, merge/export (GGUF/ONNX/TensorRT/BitNet/TorchAO), the Anthropic Messages endpoint, speculative decoding, deploy autopilot, the Web UI, and Agent Forge.
 
 **Contents:**
 
 - [Merge LoRA Adapter](#merge-lora-adapter)
 - [Export to GGUF](#export-to-gguf)
 - [Batch Inference](#batch-inference)
+- [Native MLX text generation](#native-mlx-text-generation)
 - [Inference Benchmarking](#inference-benchmarking)
 - [Inference Server](#inference-server)
 - [Web UI](#web-ui)
@@ -38,7 +39,29 @@ soup merge --adapter ./output --output ./merged
 
 # Specify base model and dtype
 soup merge --adapter ./output --base meta-llama/Llama-3.1-8B --dtype bfloat16
+
+# Merge tensor by tensor without loading the model into RAM
+soup merge --adapter ./output --output ./merged --low-memory
 ```
+
+`--low-memory` reads the base `.safetensors` files and writes the merged files
+one tensor at a time, so peak RAM is about one shard (the largest `.safetensors`
+file; a single-file model is memory-mapped as a whole, so it saves little). The
+tensor values are the same as the regular merge, but the output keeps the base's
+shard layout instead of a single `model.safetensors`. It needs the default
+`fp16` save format and a plain LoRA adapter; DoRA, `modules_to_save`, rank or
+alpha patterns, adapters on embeddings or `lm_head`, and base weights stored in a
+quantized dtype are refused with a message to run the regular merge. The merge is
+written to a staging directory next to `--output` and moved into place only when
+complete; an existing non-empty `--output` is not overwritten, and base-model
+files that are symlinks pointing outside the model directory (other than a
+Hugging Face cache snapshot) are refused. Only tokenizer and config files
+(`.json`, `.model`, `.txt`, `.tiktoken`, `.jinja`) are copied from the base, plus
+`.py` files when `--trust-remote-code` is given. Adapter values that cannot be
+used safely (a non-positive `r`, a non-finite `lora_alpha`, non-boolean flags,
+mismatched LoRA shapes) are refused before anything is written.
+Measured on a 1.4 GB Llama-shaped model: 1635 MiB of working memory for the
+regular merge against about 190 MiB with `--low-memory`.
 
 ReLoRA training outputs are already standalone dense models: Soup merges the
 final active adapter into the accumulated in-memory base before writing the
@@ -247,8 +270,8 @@ Auto-detected chat templates: `chatml`, `llama`, `mistral`, `vicuna`, `zephyr` (
 
 `soup export` integrates with Soup's local artifact registry and deployment workflows:
 
-- **Deploying on export (`--deploy`)**: `--deploy ollama` is supported for GGUF-family formats (`gguf`, `gguf-ud`, `bitnet`, `tq1_0`). For non-GGUF formats (`onnx`, `tensorrt`, `awq`, `gptq`, `torchao`), `--deploy` fails fast with an informative error because Ollama cannot load non-GGUF weight files. Use `--deploy-name` to assign a custom model name in Ollama.
-- **Registering exports (`--registry-id`)**: Pass `--registry-id <id>` to record and attach exported artifacts to a local registry entry across all export formats (`gguf`, `gguf-ud`, `bitnet`, `tq1_0`, `onnx`, `tensorrt`, `awq`, `gptq`, `torchao`). When an export produces a directory (such as multi-shard safetensors, ONNX data, or TensorRT engine files in `<output>/engine/*.engine`), all produced weight and engine files are discovered and attached to the registry entry.
+- **Deploying on export (`--deploy`)**: `--deploy ollama` is supported for GGUF-family formats (`gguf`, `gguf-ud`, `bitnet`, `tq1_0`). For non-GGUF formats (`onnx`, `tensorrt`, `torchao`), `--deploy` fails fast with an informative error because Ollama cannot load non-GGUF weight files. Use `--deploy-name` to assign a custom model name in Ollama.
+- **Registering exports (`--registry-id`)**: Pass `--registry-id <id>` to record and attach exported artifacts to a local registry entry across all export formats (`gguf`, `gguf-ud`, `bitnet`, `tq1_0`, `onnx`, `tensorrt`, `torchao`). When an export produces a directory (such as multi-shard safetensors, ONNX data, or TensorRT engine files in `<output>/engine/*.engine`), all produced weight and engine files are discovered and attached to the registry entry.
 
 
 ## Batch Inference
@@ -268,6 +291,48 @@ soup infer --model ./output --input prompts.jsonl --output results.jsonl \
 ```
 
 Output is JSONL with `prompt`, `response`, and `tokens_generated` fields. Shows a progress bar and throughput summary.
+
+
+### Native MLX text generation
+
+On Apple Silicon, install `soup-cli[mlx]` and select the native backend explicitly:
+
+```bash
+soup infer --backend mlx --model ./mlx-adapter --input prompts.jsonl --output results.jsonl
+# A local native base model also works without an adapter:
+soup infer --backend mlx --model ./mlx-base --input prompts.jsonl --output results.jsonl
+```
+
+Inference uses a shared MLX loader and generation implementation. Native Soup
+adapters carry `model`, `num_layers` and resolved `lora_parameters` in
+`adapter_config.json`, alongside `adapters.safetensors`. The base identity comes from
+that metadata; `--base`, if supplied, must identify the same base. A relative base
+path in the metadata is resolved from the inference command's current directory,
+so run from the training directory or use an absolute base path when training.
+All saved tensor names and shapes must exactly match the reconstructed adapter. Missing, extra,
+nonfinite or incompatible tensors fail before generation. A native adapter supplied
+to the default Transformers backend is refused with a backend hint.
+
+The initial native consumer supports ordinary linear text LoRA (including the saved
+rsLoRA scale), with dense or genuinely 4-bit MLX bases, and base-only generation.
+DoRA, full-finetune adapters, embedding/switch-layer targets and other quantized
+adapter targets are refused. This does not add MLX serving or adapter fusion.
+Use the base tokenizer's chat template; rendered special tokens are encoded once.
+Temperature zero selects greedy decoding; positive temperature uses nucleus sampling
+with `top_p=0.9`, matching the Transformers inference default. `--max-tokens`
+limits generation to 1–16384 tokens. No seed flag or reproducibility promise for
+sampling is introduced. Declared model and tokenizer EOS IDs terminate generation; batch
+`tokens_generated` includes a sampled terminating token, while `response` contains
+completion text only.
+
+MLX selects its native device: omit `--device`. Only the HF/local source path,
+`--task text` and `--batch-size 1` are supported; CUDA graphs are refused. Batch
+rows retain their input order and JSONL schema. If generation fails, already flushed
+rows remain available and the command fails without reporting completion.
+Model loading remains subject to `--trust-remote-code`; it is disabled by default.
+The shared remote-code policy refuses a local base that declares custom code
+unless the flag is supplied, and prints the same opt-in warning as Transformers.
+The MLX path does not import Torch, PEFT or TRL.
 
 
 ## Inference Benchmarking
@@ -609,6 +674,17 @@ curl http://localhost:8000/v1/adapters
 # → {"adapters": [{"name": "chat", "active": true}, ...], "active": "chat"}
 ```
 
+A server started with `--tool-auth-token` requires that token on all three adapter
+routes, loopback included, and answers 401 without it. A non-loopback bind always has
+one, since `soup serve` refuses to start there without it:
+
+```bash
+soup serve --model base-model --adapters chat=./chat-adapter --host 0.0.0.0 --tool-auth-token "$TOKEN"
+
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/v1/adapters/activate/chat
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/v1/adapters
+```
+
 Names are validated against `^[a-zA-Z0-9][a-zA-Z0-9-]*$`; activate/deactivate calls are thread-safe behind a lock. Activate/deactivate also check the `Host` and `Origin` headers (see [Server-Side Tool Endpoints](#server-side-tool-endpoints)).
 
 ### Multi-Tenant Vector Bank (`soup serve --bank`)
@@ -748,7 +824,7 @@ still records the URL it was given.
 
 **Pages:**
 - **Dashboard** — view all experiment runs, loss charts, system info, multi-run comparison
-- **New Training** — create configs from templates or 169 ready-made recipes, validate, start training with live SSE log streaming and progress bar
+- **New Training** — create configs from templates or 171 ready-made recipes, validate, start training with live SSE log streaming and progress bar
 - **Data Explorer** — browse and inspect datasets (JSONL, JSON, CSV, Parquet)
 - **Model Chat** — chat with streaming responses, configurable temperature/top_p/max_tokens, system prompt, adapter selection, markdown rendering, chat export
 
@@ -757,7 +833,7 @@ still records the URL it was given.
 - **Enhanced Metrics** — 2x2 chart grid (loss, LR, grad_norm, throughput) + GPU memory chart, eval results table
 - **Multi-Run Compare** — overlay loss curves from up to 5 runs side-by-side
 - **Chat Upgrade** — SSE streaming via proxy, typing indicator, cancel button, markdown renderer (bold, italic, code blocks), chat export as JSON
-- **Config Builder** — recipe dropdown (169 recipes), config schema API for dynamic form generation
+- **Config Builder** — recipe dropdown (171 recipes), config schema API for dynamic form generation
 
 Gradient norm is nullable: backends or steps that do not report it store and
 stream `null`, and the Web UI chart leaves a gap instead of drawing a false
@@ -814,7 +890,7 @@ soup quantize ./out --to gguf --bits 4
 soup quantize ./out --to onnx -o ./out-onnx
 ```
 
-Prints the equivalent `soup export …` invocation (escaped via `shlex.quote`) for copy-paste. Intentionally does NOT in-process call `soup export` — Typer commands aren't safe to re-enter. `--to awq` and `--to gptq` still print their command, followed by a notice that the two formats are deprecated and will be removed in Soup v0.77.
+Prints the equivalent `soup export …` invocation (escaped via `shlex.quote`) for copy-paste. Intentionally does NOT in-process call `soup export` — Typer commands aren't safe to re-enter.
 
 
 ## Llama.cpp Proxy
@@ -834,7 +910,7 @@ closed allowlist / filtered-env rules as the other `soup llama` subcommands). Us
 it when you already have a GGUF and want llama.cpp's quantizer directly, rather
 than going through `soup export --format gguf` / `soup quantize`.
 
-Closed allowlist: `cli` / `mtmd-cli` / `gguf-split` / `server` / `quantize`. Forwards to `llama-*` binary on PATH (`shutil.which`) with **filtered child env** — `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and other secrets are dropped before exec; only `PATH` / `HOME` / `USER` / locale + llama.cpp-recognised `LLAMA_CPP_HOME` / `GGML_*` / `OMP_NUM_THREADS` are forwarded.
+Closed allowlist: `cli` / `mtmd-cli` / `gguf-split` / `server` / `quantize`. Forwards to the `llama-*` binary found in an absolute `PATH` directory (empty and relative entries and the current directory are not searched) with a **filtered child env** — `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and other secrets are dropped before exec; only `PATH` / `PATHEXT` / `SYSTEMROOT` / `NoDefaultCurrentDirectoryInExePath`, `HOME` / `USER` / `USERPROFILE` / `TMP` / `TEMP`, locale (`LANG` / `LC_ALL` / `LC_CTYPE`), `TERM` / `COLORTERM` and the llama.cpp-recognised `LLAMA_CPP_HOME` / `GGML_CUDA` / `GGML_METAL` / `OMP_NUM_THREADS` are forwarded. Names are matched without regard to case on Windows.
 
 
 ## Tail-Latency Stats + Tool-Call Timer
@@ -974,24 +1050,68 @@ Three POST routes are now available on `soup serve`:
 
 - **`POST /v1/tools/python`** — runs caller-supplied Python code in an isolated
   sub-process. Bounded by 512 MB memory, 5-second wall-clock timeout, and a
-  single-worker concurrency cap.
+  cap of four concurrent runs (shared with the code-execution rewards). Like `/v1/tools/bash`, it runs the code only under
+  OS-level isolation: on Linux with Python 3.12+ when `os.unshare` creates new user,
+  network and PID namespaces for the run, and on macOS when `/usr/bin/sandbox-exec` exists.
+  Anywhere else it answers HTTP 501 without running the code, including on Windows, on
+  Linux with Python 3.11, and on a Linux host or container that refuses those namespaces.
+  This is not a filesystem sandbox: the code runs as the server's user, with the network
+  cut and a scrubbed environment, and can read and write every file that user can (SSH
+  keys, Hugging Face tokens, configs) and, on Linux, send signals to that user's processes.
+  On macOS the profile allows reading every file, writing in the temporary directories and
+  sending signals only to the run itself. Run
+  `soup serve` in a container, a VM or under a dedicated unprivileged account for any
+  caller you do not fully trust.
 - **`POST /v1/tools/web_search`** — searches the web and returns domain-filtered results
   as `[{url, title, snippet}]` with snippets sanitized (null bytes stripped).
   Deny-by-default via `WebSearchConfig.domain_allowlist`.
 
 - **`POST /v1/tools/bash`** — runs a bash command with strict OS-level network
   isolation (`unshare` on supported Linux runtimes, `sandbox-exec` on macOS).
-  Enforces mandatory Bearer token authentication when bound to a non-loopback host,
+  Enforces the `--tool-auth-token` Bearer token on every bind,
   a 5-second wall-clock timeout, a minimal secret-scrubbed environment, and a combined
   10KB stdout/stderr streaming kill limit. Returns the real stdout, stderr, exit code,
-  and timeout state. This is not a filesystem sandbox: the child retains the server
-  process's read access to world-readable system files. The endpoint fails closed with
+  and timeout state. This is not a filesystem sandbox: as with `/v1/tools/python`, the
+  command runs as the server's user and can read and write every file that user can and,
+  on Linux, send signals to that user's processes (on macOS the same profile limits writes
+  to the temporary directories and signals to the run itself); only the network is cut.
+  The endpoint fails closed with
   HTTP 501 when strict OS isolation is unavailable (including on Windows or restricted
   Linux containers).
 
+**`/v1/tools/python` and `/v1/tools/bash` need `--tool-auth-token` on every bind.** A
+server started without it answers both routes with 401 on loopback too, as it already did
+on any other bind, and the reply names the fix. The token is checked before the OS-level
+isolation requirement above, so without it the reply is 401 even on a host where the route
+would answer 501; with it, the isolation rule decides. Start the server with a token, from
+the option or from `SOUP_TOOL_AUTH_TOKEN` (which keeps it off the command line and out of
+the shell history), and send it as a Bearer header:
+
+```bash
+export SOUP_TOOL_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+soup serve --model ./output
+
+curl -X POST http://127.0.0.1:8000/v1/tools/python \
+  -H "Authorization: Bearer $SOUP_TOOL_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "print(1)"}'
+```
+
+The token is the only thing between a caller and code execution as the server's user. Use
+a long random one, such as the one generated above
+(`python -c "import secrets; print(secrets.token_urlsafe(32))"`), and keep the server on
+loopback or behind a proxy that terminates TLS: the Bearer header is sent in clear text
+over plain HTTP.
+
+`/v1/tools/web_search`, `/v1/thumbs` and the adapter routes keep their rule: on a loopback
+bind they take a token only when the server has one.
+
 Tool routes, `/v1/thumbs` and adapter activate/deactivate accept requests only when the
 `Host` header names the bound address (any loopback name for a loopback bind) and any
-`Origin` header names the same; otherwise they answer 421 or 403.
+`Origin` header names the same; otherwise they answer 421 or 403. That check runs first.
+The tool routes and all three adapter routes (`GET /v1/adapters`, activate, deactivate)
+then also require `Authorization: Bearer <token>` whenever `--tool-auth-token` is set,
+on loopback too, and answer 401 without it.
 
 The generation routes (`/v1/chat/completions`, `/v1/messages`) and the adapter listing
 (`GET /v1/adapters`) carry the narrower half of that check: a request whose `Origin` names

@@ -1,4 +1,7 @@
-"""Native DoRA lifecycle on a tiny, local random Llama; no model downloads."""
+"""Native adapter lifecycles (DoRA and SFT watchdog); no model downloads.
+
+Kept together because mlx-smoke already selects this file on Apple Silicon.
+"""
 
 import json
 import math
@@ -21,11 +24,11 @@ from soup_cli.config.schema import SoupConfig  # noqa: E402
 from soup_cli.trainer.mlx_sft import MLXSFTTrainerWrapper  # noqa: E402
 
 
-def _checkpoint(path, quantized=False):
+def _checkpoint(path, quantized=False, *, layers=1):
     path.mkdir()
     mx.random.seed(7)
     config = dict(
-        model_type="llama", hidden_size=64, num_hidden_layers=1, intermediate_size=128,
+        model_type="llama", hidden_size=64, num_hidden_layers=layers, intermediate_size=128,
         num_attention_heads=4, num_key_value_heads=4, rms_norm_eps=1e-5,
         vocab_size=32, tie_word_embeddings=False,
     )
@@ -247,3 +250,284 @@ def test_plain_lora_still_constructs_lora_layers(tmp_path):
     assert isinstance(wrapper.model.layers[0].self_attn.q_proj, LoRALinear)
     assert not any(name.endswith(".m")
                    for name, _ in tree_flatten(wrapper.model.trainable_parameters()))
+
+
+def test_native_generation_preserves_tokenizer_and_model_eos(tmp_path):
+    """The dependency floor otherwise drops tokenizer EOS when model EOS differs."""
+    from soup_cli.utils.mlx_generation import generate_native, load_native_model
+
+    base = _checkpoint(tmp_path / "base")
+    config = json.loads((base / "config.json").read_text())
+    config["eos_token_id"] = [2, 3]
+    (base / "config.json").write_text(json.dumps(config))
+    tokenizer_config = json.loads((base / "tokenizer_config.json").read_text())
+    tokenizer_config["eos_token"] = "<unk>"
+    (base / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+    weights = mx.load(str(base / "model.safetensors"))
+    # Equal logits deterministically sample token zero, the tokenizer's declared EOS.
+    weights["lm_head.weight"] = mx.zeros_like(weights["lm_head.weight"])
+    mx.save_safetensors(str(base / "model.safetensors"), weights)
+
+    model, tokenizer = load_native_model(str(base))
+    assert tokenizer.eos_token_id == 0
+    assert tokenizer.eos_token_ids == {0, 2, 3}
+    assert generate_native(
+        model, tokenizer, [{"role": "user", "content": "alpha"}],
+        max_tokens=4, temperature=0,
+    ) == ("", 1)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("targets", [["lm_head"], "auto"], ids=["head", "auto-two-layers"])
+def test_native_generation_fresh_process_consumers_and_strict_weights(
+    tmp_path, quantized, targets, monkeypatch,
+):
+    """A real trained LoRA survives inference in a fresh process."""
+    import os
+    import subprocess
+    import sys
+
+    monkeypatch.chdir(tmp_path)
+    base = _checkpoint(tmp_path / "base", quantized, layers=2 if targets == "auto" else 1)
+    adapter = tmp_path / "adapter"
+    cfg = _config(base, adapter, dora=False, quantized=quantized, targets=targets)
+    cfg.training.lr = 0.01
+    cfg.training.epochs = 4
+    wrapper = MLXSFTTrainerWrapper(cfg)
+    wrapper.setup(_rows())
+    assert isinstance(wrapper.model.lm_head, nn.QuantizedLinear) is quantized
+    if quantized:
+        assert wrapper.model.lm_head.bits == 4
+        assert wrapper.model.lm_head.weight.dtype == mx.uint32
+    frozen = dict(tree_flatten(wrapper.model.parameters()))
+    mx.eval(frozen)
+    outcome = wrapper.train()
+    assert math.isfinite(outcome["final_loss"])
+    trained = dict(tree_flatten(wrapper.model.parameters()))
+    for name, value in frozen.items():
+        parent, leaf = name.rsplit(".", 1)
+        actual = trained.get(f"{parent}.linear.{leaf}", trained.get(name))
+        assert mx.array_equal(value, actual).item(), name
+    saved = mx.load(str(adapter / "adapters.safetensors"))
+    if targets == "auto":
+        assert set(saved) == {
+            f"model.layers.{layer}.self_attn.{projection}.lora_{matrix}"
+            for layer in (0, 1) for projection in ("q_proj", "v_proj") for matrix in ("a", "b")
+        }
+    assert any(not mx.array_equal(value, mx.zeros_like(value)).item()
+               for name, value in saved.items() if name.endswith("lora_b"))
+    wrapper.model.eval()
+    expected_logits = wrapper.model(mx.array([[5, 6, 7, 5]]))
+    mx.save_safetensors(str(tmp_path / "trained-logits.safetensors"), {"logits": expected_logits})
+    metadata = json.loads((adapter / "adapter_config.json").read_text())
+    assert metadata["model"] == str(base)
+    assert metadata["lora_parameters"]["scale"] == 2.0
+    if targets == "auto":
+        assert metadata["num_layers"] == 2
+        assert set(metadata["lora_parameters"]["keys"]) == {"self_attn.q_proj", "self_attn.v_proj"}
+    script = r'''
+import json, sys
+from pathlib import Path
+import mlx.core as mx
+from typer.testing import CliRunner
+from soup_cli.cli import app
+from soup_cli.utils.mlx_generation import load_native_model, generate_native
+model, tokenizer = load_native_model("adapter")
+base, _ = load_native_model("base")
+tokens = mx.array([[5, 6, 7, 5]])
+assert mx.allclose(model(tokens), mx.load("trained-logits.safetensors")["logits"],
+                   atol=1e-5, rtol=1e-5).item()
+assert not mx.allclose(model(tokens), base(tokens), atol=1e-5, rtol=1e-5).item()
+messages = [{"role": "user", "content": "alpha"}]
+expected, count = generate_native(model, tokenizer, messages, max_tokens=4, temperature=0)
+control, _ = generate_native(base, tokenizer, messages, max_tokens=4, temperature=0)
+if sys.argv[1] == "head":
+    assert expected != control, (expected, control)
+Path("prompts.jsonl").write_text('{"prompt":"alpha"}\n{"prompt":"beta"}\n')
+runner = CliRunner()
+result = runner.invoke(app, ["infer", "--backend", "mlx", "--model", "adapter",
+                            "--input", "prompts.jsonl", "--output", "results.jsonl",
+                            "--temperature", "0", "--max-tokens", "4"])
+assert result.exit_code == 0, (result.output, repr(result.exception))
+rows = [json.loads(line) for line in Path("results.jsonl").read_text().splitlines()]
+assert [row["prompt"] for row in rows] == ["alpha", "beta"]
+assert rows[0]["response"] == expected
+assert rows[0]["tokens_generated"] == count
+Path("consumer-evidence.json").write_text(json.dumps({"response": expected, "base": control,
+                                                    "tokens_generated": count}))
+'''
+    env = dict(os.environ, HF_HUB_OFFLINE="1")
+    env["PYTHONPATH"] = str(__import__("pathlib").Path(__file__).parents[1] / "src")
+    completed = subprocess.run(
+        [sys.executable, "-c", script, "auto" if targets == "auto" else "head"],
+        cwd=tmp_path, env=env,
+        text=True, capture_output=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    evidence = json.loads((tmp_path / "consumer-evidence.json").read_text())
+    if targets != "auto":
+        assert evidence["response"] != evidence["base"]
+
+    from soup_cli.utils.mlx_generation import load_native_model
+
+    for mutation in ("missing", "extra", "shape", "nonfinite", "integer", "truncated"):
+        weights = dict(saved)
+        name = next(iter(weights))
+        if mutation == "missing":
+            del weights[name]
+        elif mutation == "extra":
+            weights["not.an.adapter"] = mx.zeros((1,))
+        elif mutation == "shape":
+            weights[name] = mx.zeros((1, 1))
+        elif mutation == "nonfinite":
+            weights[name] = mx.full(weights[name].shape, float("nan"))
+        else:
+            weights[name] = mx.zeros(weights[name].shape, dtype=mx.int32)
+        if mutation == "truncated":
+            (adapter / "adapters.safetensors").write_bytes(b"truncated")
+        else:
+            mx.save_safetensors(str(adapter / "adapters.safetensors"), weights)
+        diagnostic = (
+            "finite floating" if mutation in ("nonfinite", "integer") else "tensor keys/shapes"
+        )
+        if mutation == "truncated":
+            diagnostic = "Cannot read native MLX adapter weights"
+        with pytest.raises(ValueError, match=diagnostic):
+            load_native_model(str(adapter))
+        from typer.testing import CliRunner
+
+        from soup_cli.cli import app
+
+        args = ["infer", "--backend", "mlx", "--model", str(adapter),
+                "--input", "prompts.jsonl", "--output", "corrupt-results.jsonl"]
+        failed = CliRunner().invoke(app, args)
+        assert failed.exit_code == 1, failed.output
+        assert "Model loaded" not in failed.output
+        assert not (tmp_path / "corrupt-results.jsonl").exists()
+    mx.save_safetensors(str(adapter / "adapters.safetensors"), saved)
+
+
+def _watchdog_wrapper(base, output, *, accum=1, enabled=True, patience=2, epochs=3, train_count=4):
+    mx.random.seed(17)
+    cfg = _config(base, output, dora=False)
+    cfg.training.epochs = epochs
+    cfg.training.gradient_accumulation_steps = accum
+    cfg.training.loss_watchdog = enabled
+    cfg.training.loss_watchdog_threshold = 0.000001
+    cfg.training.loss_watchdog_patience = patience
+    cfg.training.logging_steps = 1
+    cfg.training.rewind_log = False
+    # Validate through the same serialized configuration loader as the CLI.
+    from soup_cli.config.loader import load_config_from_string
+
+    wrapper = MLXSFTTrainerWrapper(load_config_from_string(cfg.model_dump_json()))
+    wrapper.setup({"train": _rows()["train"][:1] * train_count})
+    return wrapper
+
+
+@pytest.mark.parametrize("accum, logging, patience", [(1, 1, 2), (2, 1, 2), (3, 1, 2), (2, 2, 1)])
+def test_native_watchdog_stops_at_exact_update_and_reloads(
+    tmp_path, monkeypatch, accum, logging, patience
+):
+    import soup_cli.trainer.mlx_optim as optim
+
+    base = _checkpoint(tmp_path / "base")
+    built = []
+    build = optim.build_optimizer
+
+    def record(plan):
+        optimizer = build(plan)
+        built.append(optimizer)
+        return optimizer
+
+    monkeypatch.setattr(optim, "build_optimizer", record)
+    wrapper = _watchdog_wrapper(base, tmp_path / "stopped", accum=accum, patience=patience)
+    wrapper.config.training.logging_steps = logging
+    result = wrapper.train()
+    assert result["stop_reason"] == "loss_watchdog"
+    assert result["training_outcome"] == "stopped"
+    assert result["completed_updates"] == 2
+    assert result["total_steps"] == 2 * accum
+    assert built[0].step.item() == 2
+    metadata = json.loads((tmp_path / "stopped" / "adapter_config.json").read_text())
+    assert metadata["completed_updates"] == 2
+    assert metadata["completed_iterations"] == 2 * accum
+    assert metadata["training_outcome"] == "stopped"
+    assert metadata["stop_reason"] == "loss_watchdog"
+    assert metadata["watchdog_report_unit"] == "optimizer updates"
+    restored, _ = load(str(base), adapter_path=str(tmp_path / "stopped"))
+    wrapper.model.eval()
+    tokens = mx.array([[5, 6, 7]])
+    assert mx.allclose(restored(tokens), wrapper.model(tokens), atol=1e-5, rtol=1e-5).item()
+
+    # Identical initial model/data/constant LR: the stopped parameters must equal
+    # exactly two updates, and differ from a disabled run's complete budget.
+    control = _watchdog_wrapper(base, tmp_path / "control", accum=accum, enabled=False,
+                                epochs=1, train_count=2 * accum)
+    control.train()
+    stopped_weights = dict(tree_flatten(wrapper.model.trainable_parameters()))
+    control_weights = dict(tree_flatten(control.model.trainable_parameters()))
+    assert built[1].step.item() == 2
+    assert all(mx.allclose(value, control_weights[name], atol=1e-6, rtol=1e-6).item()
+               for name, value in stopped_weights.items())
+    full = _watchdog_wrapper(base, tmp_path / "full", accum=accum, enabled=False)
+    full_result = full.train()
+    full_weights = dict(tree_flatten(full.model.trainable_parameters()))
+    assert full_result["total_steps"] > result["total_steps"]
+    assert built[2].step.item() > 2
+    assert any(not mx.array_equal(value, full_weights[name]).item()
+               for name, value in stopped_weights.items())
+
+
+def test_public_cli_watchdog_reports_early_stop_and_saves(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from soup_cli.cli import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    base = _checkpoint(tmp_path / "base")
+    wrapper = _watchdog_wrapper(base, tmp_path / "out", accum=2)
+    wrapper.config.training.rewind_log = True
+    data = tmp_path / "data.jsonl"
+    data.write_text("\n".join(json.dumps(row) for row in _rows()["train"]) + "\n")
+    wrapper.config.data.train = str(data)
+    wrapper.config.data.format = "plaintext"
+    wrapper.config.data.val_split = 0
+    config = tmp_path / "soup.json"
+    config.write_text(wrapper.config.model_dump_json())
+    outcome = CliRunner().invoke(app, ["train", "--config", str(config), "--yes"])
+    assert outcome.exit_code == 0, (outcome.output, repr(outcome.exception))
+    assert "Loss watchdog" in outcome.output
+    assert "Training Stopped" in outcome.output
+    assert "Training Complete!" not in outcome.output
+    metadata = json.loads((tmp_path / "out" / "adapter_config.json").read_text())
+    assert metadata["completed_updates"] == 2
+    assert metadata["stop_reason"] == "loss_watchdog"
+    from soup_cli.experiment.tracker import ExperimentTracker
+
+    tracker = ExperimentTracker()
+    run = tracker.list_runs()[0]
+    assert run["status"] == "completed"  # successful finalization, documented separately
+    assert run["total_steps"] == 4
+    assert [row["step"] for row in tracker.get_metrics(run["run_id"])
+            if row["loss"] is not None] == [2, 4]
+    records = [json.loads(line) for line in (tmp_path / "out" / "rewind.jsonl")
+               .read_text().splitlines()]
+    assert [(row["step"], row["micro"]) for row in records if row["kind"] == "batch"] == [
+        (1, 0), (1, 1), (2, 0), (2, 1),
+    ]
+    restored, _ = load(str(base), adapter_path=str(tmp_path / "out"))
+    assert mx.isfinite(restored(mx.array([[5, 6, 7]]))).all().item()
+
+
+def test_native_watchdog_runs_final_eval_at_stopped_update(tmp_path):
+    base = _checkpoint(tmp_path / "base")
+    wrapper = _watchdog_wrapper(base, tmp_path / "out", accum=2)
+    wrapper.config.training.eval_steps = 3
+    wrapper._dataset["val"] = _rows()["train"][:1]
+    result = wrapper.train()
+    assert result["completed_updates"] == 2
+    assert result["eval_updates"] == [2]
+    assert wrapper._eval_log[0]["optimizer_step"] == 2
+    assert math.isfinite(result["val_loss"])
