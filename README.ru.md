@@ -1,4 +1,4 @@
-<!-- synced-from: README.md sha256:68116cad1e8bc34f44b84b0bd129b759a4bb925afbac84118cfd2309480c83b1 -->
+<!-- synced-from: README.md sha256:e6f82927020a21ba77157b9c2891d7b7918a7eb34e2a291a4fa7ecbd0fb90f0a -->
 <p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <a href="README.ja.md">日本語</a> | <a href="README.zh.md">中文</a> | <strong>Русский</strong></p>
 
 <p align="center">
@@ -94,63 +94,62 @@ RTX 3050 Laptop 4 GB: Llama-3.1-8B-Instruct + NF4 показывает **119.6 t
 
 ## Что нового
 
-**v0.76.0 — настройки, которые Soup принимал, но не применял, теперь останавливают загрузку.** Опции,
-которые проверялись и описывались в документации, но не читались в пути, который они якобы
-настраивали, теперь отклоняются при загрузке с указанием настройки и способа исправления; для
-остальных выводится предупреждение и указывается выпуск, начиная с которого они будут отклоняться.
-Конфигурация, которая раньше загружалась, теперь может не загрузиться: сначала выполните
-`soup doctor --config soup.yaml`.
+**v0.77.0 — то, о чём предупреждала v0.76, теперь отклоняется.** 31 поле конфигурации, которое никто
+не читает, и три устаревших значения больше не загружаются с предупреждением: загрузка
+останавливается, выводя по одной строке на каждую настройку с её названием и указанием, что удалить.
+Конфигурация, которая загружалась на v0.76 (с предупреждениями или молча), может перестать
+загружаться на v0.77: сначала выполните `soup doctor --config soup.yaml`.
 
-- **Несовместимое изменение: настройка, которая никогда не действовала, отклоняется при загрузке.**
-  Среди таких настроек: `training.quantization_aware: true` (обучение с учётом квантования фактически
-  не выполнялось), `training.use_longlora`, `training.ebft_variant`, `training.gdpo_variant`,
-  `training.rope_scaling_type` там, где её не читает ни один этап настройки, `freeze_layers` /
-  `freeze_ratio` вне текстового пути `sft` / `tts` на бэкенде transformers,
-  `auto_mixed_precision` вне `sft` / `tts`, а также `backend: unsloth` ещё для семи задач без
-  настройки unsloth. Каждое сообщение называет поле и указывает, что изменить.
-  `lr_groups`, `early_stop_patience`, `forgetting_eval_steps` и другие неиспользуемые параметры
-  теперь вызывают предупреждение при загрузке и будут отклоняться начиная с v0.77.
-- **Теперь вычисляется валидационный loss.** `data.val_split` исключал строки из обучения при каждом
-  запуске, но ни один trainer на бэкенде transformers их не оценивал. Теперь каждая задача с
-  выделенной валидационной выборкой оценивает её в конце каждой эпохи или каждые N шагов через
-  `training.eval_steps` и записывает val loss; запуск занимает на несколько процентов больше времени.
-  **Несовместимое изменение для `grpo`, `ppo` и `online_dpo`:** по умолчанию строки больше не
-  выделяются для валидации (`data.val_split` игнорируется с пояснением), поэтому в обучении участвуют
-  все строки.
-- **Несовместимое изменение: все нестандартные `grpo_variant` применяют KL-штраф `grpo_beta`.**
-  `gspo`, `dapo`, `dr_grpo`, `bnpo`, `two_sided` и `rft` проверяли `grpo_beta`, но не
-  применяли его, поэтому существующие конфигурации вариантов не воспроизведут прежние запуски.
-  Теперь `grpo_beta: 0` работает без KL и пропускает прямой проход эталонной модели.
-- **Потоковая загрузка слоёв читает дисковый уровень в фоновом потоке через direct I/O и может
-  распределять данные по NVMe-накопителям.** Для хранилища NF4 на 36 GB в форме модели 70B,
-  превышающего объём RAM (одна машина с RTX 5070 Laptop 8 GB), холодный шаг сократился со 110.5 s
-  при синхронном чтении до 16.2–17.3 s; распределение по двум накопителям через
-  `SOUP_LAYER_STREAM_STRIPE_DIRS` сократило время с 17.4 s до 9.97 s (проба под длительной нагрузкой:
-  два раунда, 1.28x и 1.41x, без формального вывода;
-  [запись](benchmarks/probe-rtx5070-two-drive-sustained.md)). Хранилище, помещающееся в RAM, по-прежнему
-  быстрее на уровне RAM, который выбирает `stream_source: auto`. Функция включается явно
-  (`stream_layers: true`) и пока остаётся BETA; записи: [direct I/O](benchmarks/gate-974-disk-tier-direct-io.md),
-  [распределение по накопителям](benchmarks/gate-two-drive-striping.md).
-- **Новые команды и параметры.** `soup adapters check` проверяет LoRA-адаптер на незаметные сбои;
-  `soup bench train` обучает фиксированное число шагов и завершается с кодом 1, если модель не обучалась
-  (проверяет `task: sft` на бэкенде transformers; `soup bench` теперь является группой команд, а
-  `soup bench infer` — прежним бенчмарком инференса); `soup data clean` очищает и исправляет датасет,
-  не изменяя входной файл; `soup recipes verify` проверяет на meta-устройстве, без загрузки весов,
-  что каждый поставляемый рецепт может подключить LoRA-адаптер; `soup rewind` называет строки датасета,
-  вызвавшие скачок loss. В `soup infer` добавлены необязательные `--batch-size` и экспериментальный
-  `--cuda-graphs` (требуется PyTorch 2.14 или новее; на одной RTX 5070 Laptop, без закрепления,
-  для Qwen2.5-1.5B в FP16 самый медленный запуск с этой опцией декодировал в 2.9x быстрее, чем самый
-  быстрый запуск без неё). `soup ab` выполняет двусторонний тест, устойчивый к дисперсии, а
-  `soup adapters sign --backend sigstore` и `soup attest emit --sign sigstore` подписывают через
-  Sigstore keyless OIDC (`pip install "soup-cli[sigstore]"`).
-- **Устаревающие параметры:** `soup export --format awq` и `--format gptq` будут удалены в v0.77;
-  оба upstream-проекта архивированы, и ни один из этих extras не устанавливается вместе с `[train]`.
-
-> Начиная с v0.77 поддерживаются только Python **3.11–3.13**: Python 3.10 достиг конца срока поддержки
-> 2026-10-01 (pip для этой версии остаётся на v0.76); на Python 3.14+ pip выбирает v0.72.4 без верхней
-> границы и непроверенные сборки PyTorch.
+- **Несовместимое изменение: отложенные (staged) поля и устаревшие значения отклоняются.** Среди
+  полей: `training.lr_groups`, `early_stop_patience`, `forgetting_eval_steps`, `checkpoint_eval_*`,
+  `quantize_ref_model`, `long_context_grpo`, `vision_grpo`, `data.split_thinking` и ключи
+  `data.video_*`. `training.rl_checkpoint_include_ref_model` и
+  `rl_checkpoint_include_rollout_buffer` были отложены после v0.76.0, поэтому ни один выпуск не
+  предупреждал о них заранее. Значения: `data.remove_unused_columns: true`,
+  `training.quantization: 4bit` / `8bit` (или `load_in_8bit: true`) для задачи, которая никогда не
+  квантует, и `soup ab --beta`. Четырнадцать настроек, которые v0.76 молча игнорировала, тоже
+  отклоняются, например `use_mod` или `neftune_alpha` там, где их ничто не применяет,
+  `expand_layers` с рангом LoRA, `8bit` или vision SFT на Unsloth и `lora.rank_pattern` на MLX или
+  Unsloth: см. примечания по обновлению в CHANGELOG.
+- **Несовместимое изменение: Python 3.11–3.13, нет экспорта AWQ и GPTQ, токен для двух маршрутов
+  `soup serve`.** Python 3.10 больше не поддерживается (конец срока поддержки 2026-10-01); на 3.10
+  pip по-прежнему выбирает v0.76.x. `soup export --format awq` / `gptq` и `soup quantize --to awq` /
+  `gptq` удалены, потому что оба upstream-проекта архивированы: используйте `gguf`, `onnx`,
+  `tensorrt`, `bitnet` или `tq1_0`, либо оставайтесь на v0.76.x. `/v1/tools/python` и
+  `/v1/tools/bash` отвечают 401, если сервер не запущен с `--tool-auth-token` (или
+  `SOUP_TOOL_AUTH_TOKEN`), при любой привязке, а `/v1/tools/python` отвечает 501, если на хосте нет
+  изоляции на уровне ОС, как это уже делал bash.
+- **DPO, ORPO, SimPO и KTO работают нативно на Apple Silicon.** `task: dpo`, `orpo`, `simpo` и
+  `kto` с `backend: mlx` обучаются через собственный цикл Soup на MLX по целевым функциям TRL (ORPO и
+  SimPO — без эталонной модели). Текстовый SFT на MLX получил нативный DoRA, `training.eval_steps`,
+  `training.seed` и loss watchdog. `lora.use_rslora` теперь применяется на MLX и Unsloth, поэтому
+  запуск с rsLoRA обучается в том масштабе, который был запрошен, и его результаты меняются.
+- **Потоковая загрузка слоёв добралась до MoE семейства DeepSeek-V3.** Потоковая загрузка слоёв Soup
+  (реализация L2L, Pudipeddi et al. 2020) теперь передаёт `model_type: deepseek_v3` с паритетом
+  резидентной и потоковой моделей в прямом и обратном проходах и деквантует FP8-чекпойнты с блочной
+  квантизацией при разбиении на шарды. Kimi-K2-Base и -Instruct допускаются после поэлементной
+  проверки полей (крошечный чекпойнт формы K2 передаётся бит в бит на CPU; на самой K2 ничего не
+  обучалось). `training.stream_expert_layout: per_expert` передаёт по одному маршрутизируемому
+  эксперту: на одной RTX 5070 Laptop 8 GB та же конфигурация LoRA для Moonlight-16B показала пик
+  1.0 GB памяти GPU против 3.1 GB при слитой раскладке (эксперты NF4 против bf16, разные уровни
+  кэша) при шаге примерно в 2.7x дольше ([запись](benchmarks/probe-rtx5070-moonlight-16b.md)).
+  `training.stream_recompute: off` / `auto` сохраняет потоковые активации вместо пересчёта с
+  идентичными до бита градиентами: на уровне RAM той же карты шаг Mistral-7B NF4 быстрее на 22% при
+  512 токенах и на 8.5% при 2048 ([запись](benchmarks/gate-stream-recompute.md)). Включается явно
+  (`stream_layers: true`), BETA.
+- **Проверяемое происхождение (provenance).** `soup registry push --data <file>` записывает SHA-256
+  файла обучения, а `--idempotency-key` делает отправку безопасной для повтора; на бэкенде
+  transformers резидентные, потоковые по слоям и многопроцессорные GPU-запуски записывают коммит Hub
+  загруженной базовой модели; `soup ship --require-provenance` сверяет доказательства с адаптером,
+  задачей и исходными байтами, версией набора и политикой вердикта, с которыми они были проштампованы.
+- **Также нового.** `soup --version`; `pip install "soup-cli[documents]"` для PDF и DOCX в
+  `soup data ingest`; `soup merge --low-memory`; GRPO может оценивать с помощью LLM-судьи
+  (`training.reward_fn: judge_rank`); а [`docs/config-reference.md`](docs/config-reference.md) и
+  [`docs/cli-reference.md`](docs/cli-reference.md) генерируются из кода, и набор тестов падает, когда
+  любая из этих страниц перестаёт описывать то, что делает код.
 
 Прежние основные изменения собраны на странице [GitHub Releases](https://github.com/MakazhanAlpamys/Soup/releases).
+
 ## Быстрый старт
 
 ### 1. Установка
@@ -349,7 +348,7 @@ Mixtral, DeepSeek R1/V3, Phi-4 и более 100 других поставляю
 
 ```bash
 docker pull ghcr.io/makazhanalpamys/soup:latest
-docker run --gpus all -v $(pwd):/workspace ghcr.io/makazhanalpamys/soup train --config soup.yaml
+docker run --gpus all -v $(pwd):/workspace ghcr.io/makazhanalpamys/soup train --config soup.yaml --yes
 docker compose up   # or build locally
 ```
 
