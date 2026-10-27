@@ -7,17 +7,17 @@ import pytest
 import yaml
 
 from soup_cli.recipes.catalog import RECIPES
+from tests.ui_helpers import ui_client as make_ui_client
 
 
 @pytest.fixture
 def ui_client() -> Iterator[tuple[object, dict[str, str]]]:
     """Yield an authenticated Web UI test client."""
     pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
 
     from soup_cli.ui.app import create_app, get_auth_token
 
-    with TestClient(create_app()) as client:
+    with make_ui_client(create_app()) as client:
         yield client, {"Authorization": f"Bearer {get_auth_token()}"}
 
 
@@ -236,4 +236,8 @@ def test_every_shipped_recipe_still_validates_through_web_ui(
     )
 
     assert response.status_code == 200, f"{name}: {response.text}"
+    if recipe.unavailable_reason:
+        assert response.json()["valid"] is False
+        assert recipe.unavailable_reason in response.text
+        return
     assert response.json()["valid"] is True, f"{name}: {response.json()}"

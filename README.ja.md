@@ -1,4 +1,4 @@
-<!-- synced-from: README.md sha256:fa009c2fcc2c94ea06e25ea8620c2fbed9bfb8ac6611bf71a2669a06f7c50b46 -->
+<!-- synced-from: README.md sha256:aa2170df59636760e0235b87cddf967a14e932605ed3abb16480115d99db6e40 -->
 <p align="center">🌍 <a href="README.md">English</a> | <a href="README.tr.md">Türkçe</a> | <a href="README.ar.md">العربية</a> | <strong>日本語</strong> | <a href="README.zh.md">中文</a></p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 <p align="center">
   <a href="https://pypi.org/project/soup-cli/"><img src="https://img.shields.io/pypi/v/soup-cli?color=blue" alt="PyPI"></a>
   <a href="https://pepy.tech/project/soup-cli"><img src="https://img.shields.io/pepy/dt/soup-cli?color=blue" alt="ダウンロード数"></a>
-  <img src="https://img.shields.io/badge/python-3.10--3.12-blue" alt="Python 3.10-3.12">
+  <img src="https://img.shields.io/badge/python-3.11--3.13-blue" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0 ライセンス">
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/MakazhanAlpamys/65fdc943f85f3b2c46ecddb415c2b779/raw/soup_tests.json" alt="テスト"></a>
   <a href="https://github.com/MakazhanAlpamys/Soup/actions"><img src="https://github.com/MakazhanAlpamys/Soup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -181,6 +181,58 @@ LLM の学習は今なお骨の折れる作業です。経験豊富なチーム�
 
 > 対応は Python **3.10–3.12** のみです。3.13 以降では、Soup が動き出す前からネイティブ拡張でクラッシュする、
 > テストされていない PyTorch の wheel を pip が解決してしまっていました。
+**v0.77.0 — v0.76 が警告していたものは、拒否されるようになりました。** 何からも読み取られない
+31 個の設定フィールドと、非推奨の三つの値は、警告付きで読み込まれることがなくなりました。読み込みは、
+設定ごとに一行で、その設定名と削除すべきものを示して停止します。v0.76 では警告付きで、あるいは黙って読み込めた設定が、
+v0.77 では読み込めなくなることがあります。まず `soup doctor --config soup.yaml` を実行してください。
+
+- **破壊的変更: ステージされたフィールドと非推奨の値は拒否されます。** 対象のフィールドには、
+  `training.lr_groups`、`early_stop_patience`、`forgetting_eval_steps`、`checkpoint_eval_*`、
+  `quantize_ref_model`、`long_context_grpo`、`vision_grpo`、`data.split_thinking`、そして
+  `data.video_*` キーが含まれます。`training.rl_checkpoint_include_ref_model` と
+  `rl_checkpoint_include_rollout_buffer` は v0.76.0 より後にステージされたため、事前に警告した
+  リリースはありません。値は、`data.remove_unused_columns: true`、量子化を一切行わないタスクでの
+  `training.quantization: 4bit` / `8bit`（または `load_in_8bit: true`）、そして `soup ab --beta` です。
+  v0.76 が何も言わずに無視していた十四個の設定も拒否されます。たとえば何も適用しない場所での `use_mod` や
+  `neftune_alpha`、LoRA ランク付きの `expand_layers`、Unsloth での `8bit` やビジョン SFT、MLX または
+  Unsloth での `lora.rank_pattern` です。CHANGELOG のアップグレードノートを参照してください。
+- **破壊的変更: Python 3.11–3.13、AWQ と GPTQ のエクスポートは廃止、`soup serve` の二つのルートに
+  トークンが必要に。** Python 3.10 はサポート対象外になりました（2026-10-01 にサポート終了）。3.10 では
+  pip は引き続き v0.76.x を解決します。`soup export --format awq` / `gptq` と
+  `soup quantize --to awq` / `gptq` は削除されました。どちらの上流プロジェクトもアーカイブ済みのためです。
+  `gguf`、`onnx`、`tensorrt`、`bitnet`、`tq1_0` を使うか、v0.76.x にとどまってください。
+  `/v1/tools/python` と `/v1/tools/bash` は、サーバーが `--tool-auth-token`（または
+  `SOUP_TOOL_AUTH_TOKEN`）付きで起動されていなければ、どのバインドでも 401 を返します。また
+  `/v1/tools/python` は、ホストに OS レベルの分離がない環境では、bash と同じく 501 を返します。
+- **DPO、ORPO、SimPO、KTO が Apple Silicon でネイティブに動作します。** `backend: mlx` での
+  `task: dpo`、`orpo`、`simpo`、`kto` は、Soup 独自の MLX ループで TRL の目的関数に従って学習します
+  （ORPO と SimPO は参照モデル不要）。MLX のテキスト SFT は、ネイティブ DoRA、`training.eval_steps`、
+  `training.seed`、損失ウォッチドッグに対応しました。`lora.use_rslora` は MLX と Unsloth で適用される
+  ようになったため、そこでの rsLoRA 実行は要求したスケールで学習し、結果が変わります。
+- **レイヤーストリーミングが DeepSeek-V3 系の MoE に対応しました。** Soup のレイヤーストリーミング
+  （L2L の実装、Pudipeddi et al. 2020）は、`model_type: deepseek_v3` を、常駐とストリーミングで
+  フォワードとバックワードの一致（パリティ）を確認したうえでストリーミングし、FP8 ブロック量子化
+  チェックポイントをシャード時に逆量子化します。Kimi-K2-Base と -Instruct は、フィールドごとの検査を
+  通ったうえで受け入れられます（K2 形状の小さなチェックポイントが CPU 上でビット単位で一致して
+  ストリーミングされます。K2 そのものでは何も学習していません）。
+  `training.stream_expert_layout: per_expert` は、ルーティングされたエキスパートを一つずつストリーミング
+  します。RTX 5070 Laptop 8 GB 一台で、同じ Moonlight-16B の LoRA 設定は、fused の 3.1 GB に対して
+  GPU メモリのピークが 1.0 GB（エキスパートは bf16 に対して NF4、キャッシュ階層も異なる）で、ステップ時間は約 2.7x でした
+  （[記録](benchmarks/probe-rtx5070-moonlight-16b.md)）。`training.stream_recompute: off` / `auto` は、
+  ストリーミングされるレイヤーのアクティベーションを再計算せずに保持し、勾配はビット単位で一致します。
+  同じカードの RAM 階層では、Mistral-7B NF4 のステップが 512 トークンで 22%、2048 で 8.5% 速くなります
+  （[記録](benchmarks/gate-stream-recompute.md)）。オプトイン方式（`stream_layers: true`）で、BETA です。
+- **検証できる来歴（provenance）。** `soup registry push --data <file>` は学習ファイルの SHA-256 を
+  記録し、`--idempotency-key` によりプッシュを安全に再試行できます。transformers バックエンドでは、常駐、
+  レイヤーストリーミング、マルチ GPU の各実行が、読み込んだベースモデルの Hub コミットを記録します。
+  `soup ship --require-provenance` は、エビデンスを、それに刻まれたアダプター・タスク・ソースのバイト列、
+  スイートのバージョン、判定ポリシーと照合します。
+- **その他の新機能。** `soup --version`。`soup data ingest` で PDF と DOCX を扱うための
+  `pip install "soup-cli[documents]"`。`soup merge --low-memory`。GRPO が LLM ジャッジで採点できる
+  ようになりました（`training.reward_fn: judge_rank`）。そして
+  [`docs/config-reference.md`](docs/config-reference.md) と
+  [`docs/cli-reference.md`](docs/cli-reference.md) はコードから生成され、どちらかがコードの動作を正しく
+  述べなくなると、テストスイートが失敗します。
 
 過去のハイライトは [GitHub Releases](https://github.com/MakazhanAlpamys/Soup/releases) ページにあります。
 
@@ -259,6 +311,7 @@ soup export --model ./output --format gguf --quant q4_k_m   # Ollama / llama.cpp
 ```
 
 その他のエクスポート先（ONNX、TensorRT、AWQ、GPTQ、BitNet）とデプロイの選択肢は
+その他のエクスポート先（ONNX、TensorRT、BitNet）とデプロイのオプションは、
 [`docs/serving-and-export.md`](docs/serving-and-export.md) にあります。
 
 ## Web UI
@@ -337,6 +390,10 @@ Alpaca、ShareGPT、ChatML、選好ペア（DPO / ORPO / SimPO / IPO / KTO）、
 そのため、ほとんどの場合は `data.train` をファイルに向けるだけで、他に変えるものは何もありません。
 形式ごとの実例付きスキーマと、データパイプライン（リモート URI、ストリーミング、シャーディング、
 インターリーブ、語彙拡張、ドキュメントの取り込み）は [`docs/data.md`](docs/data.md#data-formats) にあります。
+埋め込み、RAFT など — すべて JSONL、JSON、CSV、Parquet、TXT から自動検出されるため、ほとんどの場合は
+`data.train` をファイルに向けるだけで、他は何も変わりません。各形式の実例つきスキーマと、データパイプライン
+（リモート URI、ストリーミング、シャーディング、インターリーブ、語彙拡張、ドキュメント取り込み）は、
+[`docs/data.md`](docs/data.md#data-formats) にあり、[Sesame CSM のネイティブ音声学習](docs/training.md#native-sesame-csm)は別途説明されています。
 
 ## よく使うコマンド
 
@@ -389,6 +446,15 @@ docker compose up   # またはローカルでビルドする
 - Python 3.10、3.11、3.12（CI でテストしているのはこれらのバージョンです。PyTorch スタックがまだ検証されて
   いないため、3.13 以降は現時点では対応していません）
 - CUDA 対応 GPU（推奨）、Apple Silicon（MPS）、または CPU（実験的 — 非常に低速）
+docker run --gpus all -v $(pwd):/workspace ghcr.io/makazhanalpamys/soup train --config soup.yaml --yes
+docker compose up   # またはローカルでビルド
+```
+
+## 動作要件
+
+- Python 3.11、3.12、または 3.13（CI がテストしているバージョンです。PyTorch スタックがまだ検証されて
+  いないため、3.14 以降は未サポートです）
+- CUDA 対応 GPU（推奨）、Apple Silicon（MPS）、または CPU（実験的 — 非常に遅い）
 - QLoRA で 7B モデルを扱うには 8 GB 以上の VRAM
 
 すべての学習タスクは、テスト用に CPU 上でも実行できます（量子化は自動的に無効になります）。オプションの
@@ -546,4 +612,4 @@ Soup のおかげで学習の実行を一回でも節約できたなら、[リ�
 
 ## ライセンス
 
-[Apache-2.0](LICENSE)。Copyright © Soup コントリビューター。
+[Apache-2.0](LICENSE)。Copyright 2026 Makazhan Alpamys and the Soup contributors。Soup またはその改変コピーを再配布する場合は、ライセンスの第4条と第6条が適用されます。コピーごとに `LICENSE` と `NOTICE` を保持し、変更したファイルにその旨を明記し、作品の出所を述べる範囲を超えて Soup の名称を使用しないでください。
