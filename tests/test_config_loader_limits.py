@@ -19,6 +19,7 @@ from soup_cli.utils.yaml_limits import (
     MAX_YAML_NESTING,
     YamlLimitError,
 )
+from tests.ui_helpers import ui_client
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -497,21 +498,21 @@ class TestCallerWithItsOwnSizeLimit:
         assert f"Config file soup.yaml {_SIZE_MESSAGE}" in _plain(result.output)
 
     def test_ship_refuses_a_config_over_its_own_limit(self, in_tmp):
-        import click
+        import typer
 
         from soup_cli.commands import ship
 
         (in_tmp / "soup.yaml").write_bytes(b"#" + b"x" * ship._MAX_CONFIG_BYTES)
-        with pytest.raises(click.exceptions.Exit):
+        with pytest.raises(typer.Exit):
             ship._parse_ship_config("soup.yaml")
 
     def test_recipes_verify_reads_no_further_than_the_limit(self, in_tmp, capsys):
-        import click
+        import typer
 
         from soup_cli.commands.recipes import _configs_to_verify
 
         (in_tmp / "soup.yaml").write_bytes(_config_of_size(MAX_CONFIG_BYTES + 1).encode())
-        with pytest.raises(click.exceptions.Exit):
+        with pytest.raises(typer.Exit):
             _configs_to_verify("soup.yaml", False)
         captured = capsys.readouterr()
         assert f"Config file soup.yaml {_SIZE_MESSAGE}" in _plain(captured.out + captured.err)
@@ -585,13 +586,12 @@ def test_command_still_loads_a_config_at_the_size_limit(in_tmp, argv):
 @pytest.mark.parametrize("limit", ["nesting", "aliases"])
 def test_web_ui_reports_the_refusal_as_an_invalid_config(limit):
     pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
 
     from soup_cli.ui.app import create_app, get_auth_token
 
     make_text, make_message = _OVER_LIMIT[limit]
     text = make_text()
-    with TestClient(create_app()) as client:
+    with ui_client(create_app()) as client:
         response = client.post(
             "/api/config/validate",
             json={"yaml": text},

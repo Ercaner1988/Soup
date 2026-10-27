@@ -443,7 +443,9 @@ class JudgeEvaluator:
             JudgeResults with aggregated scores.
         """
         judge_scores: list[JudgeScore] = []
-        for item in items:
+        from soup_cli.utils.ship_progress import track
+
+        for item in track(items, len(items)):
             score = self.evaluate(
                 prompt=item["prompt"],
                 response=item["response"],
@@ -467,8 +469,13 @@ class JudgeEvaluator:
         )
         return _parse_pairwise(self._call_llm(judge_prompt))
 
-    def _call_llm(self, prompt: str) -> str:
-        """Call the judge LLM. Uses OpenAI-compatible API for all providers."""
+    def _call_llm(self, prompt: str, max_tokens: int = 1024) -> str:
+        """Call the judge LLM. Uses OpenAI-compatible API for all providers.
+
+        ``max_tokens`` caps the reply; GRPO's ``judge_rank`` reward sets it from
+        ``training.grpo_judge_max_tokens`` (#2047). Every other caller keeps the
+        default, so its request is unchanged.
+        """
         if self.provider == "ollama":
             base = self.api_base or "http://localhost:11434"
             url = f"{base}/v1/chat/completions"
@@ -487,7 +494,7 @@ class JudgeEvaluator:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
         }
 
         try:
@@ -550,11 +557,23 @@ def _judge_request(url: str, payload: dict, headers: dict, *, timeout: float = 1
     """
     import httpx
 
+    from soup_cli.utils.http_response import (
+        JUDGE_RESPONSE_LIMIT_BYTES,
+        ResponseTooLargeError,
+        post_capped,
+    )
+
     failure = ""
     for attempt in range(JUDGE_MAX_RETRIES + 1):
         retry_after: Optional[str] = None
         try:
-            resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+            resp = post_capped(
+                url, json=payload, headers=headers, timeout=timeout,
+                max_bytes=JUDGE_RESPONSE_LIMIT_BYTES,
+                endpoint_label="judge --api-base / --judge-api-base / judge_model",
+            )
+        except ResponseTooLargeError as exc:
+            raise JudgeUnavailableError(str(exc), url=url) from exc
         except httpx.TransportError as exc:
             failure = f"{type(exc).__name__}: {exc}"
         except httpx.RequestError as exc:  # e.g. DecodingError: not transient, no retry
@@ -663,7 +682,9 @@ def pairwise_winrate(
     if not pairs:
         return 0.5
     total = 0.0
-    for index, (prompt, base_resp, tuned_resp) in enumerate(pairs):
+    from soup_cli.utils.ship_progress import track
+
+    for index, (prompt, base_resp, tuned_resp) in enumerate(track(pairs, len(pairs))):
         try:
             verdict = pairwise_compare(prompt, base_resp, tuned_resp, evaluator, swap=True)
         except JudgeUnavailableError as exc:
