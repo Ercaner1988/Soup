@@ -45,15 +45,11 @@ def _load_yaml_config(path: str) -> dict:
     data = load_yaml_file_limited(path, f"config {path!r}", max_bytes=MAX_CONFIG_BYTES)
     if not isinstance(data, dict):
         raise ValueError("config must parse to a dict")
-    from soup_cli.config.unknown_keys import find_unknown_config_keys, format_unknown_keys
-    from soup_cli.utils.terminal import for_terminal
+    # The loader's own checks, so the plan refuses what `soup train` refuses,
+    # with the same lines (exit 1). The plan is still built from ``data``.
+    from soup_cli.config.loader import validate_config_mapping
 
-    unknown = find_unknown_config_keys(data)
-    if unknown:
-        message = format_unknown_keys(unknown, include_deadline=False)
-        console.print("[red bold]Config validation error:[/]\n")
-        console.print(f"  [red]{for_terminal(message)}[/]")
-        raise SystemExit(1)
+    validate_config_mapping(data)
     return data
 
 

@@ -117,6 +117,8 @@ def filtered_environment(
     Windows variable names are case-insensitive (``SystemRoot`` is
     ``SYSTEMROOT``), so there they are matched folded to upper case, and
     exactly everywhere else; ``case_insensitive`` overrides the platform rule.
+    On Windows ``NoDefaultCurrentDirectoryInExePath=1`` is set, as
+    :func:`tool_environment` sets it.
     """
     source = os.environ if environ is None else environ
     if case_insensitive is None:
@@ -124,8 +126,32 @@ def filtered_environment(
     wanted = set(names) | set(ALWAYS_KEPT_ENV_NAMES)
     if case_insensitive:
         folded = {name.upper() for name in wanted}
-        return {name: value for name, value in source.items() if name.upper() in folded}
-    return {name: value for name, value in source.items() if name in wanted}
+        env = {name: value for name, value in source.items() if name.upper() in folded}
+    else:
+        env = {name: value for name, value in source.items() if name in wanted}
+    if os.name == "nt":
+        env = {name: value for name, value in env.items() if name.upper() != _NO_CWD_SEARCH}
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"
+    return env
+
+
+_NO_CWD_SEARCH = "NODEFAULTCURRENTDIRECTORYINEXEPATH"
+
+
+def exclude_current_directory_from_program_search() -> None:
+    """On Windows, leave the current directory out of the program search of
+    this process and of the programs it starts.
+
+    Windows looks for a program started by bare name in the current directory
+    before PATH unless ``NoDefaultCurrentDirectoryInExePath`` is set in the
+    environment of the process that starts it. This sets it in ``os.environ``
+    when it is not set already, so it applies to the programs that Soup's own
+    libraries start by bare name and is inherited by every child. Elsewhere it
+    does nothing: there the current directory is searched only through an
+    empty or relative PATH entry.
+    """
+    if os.name == "nt":
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
 
 
 def controller_source() -> str:

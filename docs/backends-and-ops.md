@@ -745,8 +745,9 @@ Submission starts Python in isolated mode (`-I`) and passes
 only the RunPod token/key path, `PATH`, `HOME`, `USERPROFILE`, proxy settings
 (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lowercase forms),
 temporary-directory settings (`TEMP`, `TMP`, `TMPDIR`), Windows settings
-(`SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `PATHEXT`, `NoDefaultCurrentDirectoryInExePath`)
-and `SSH_AUTH_SOCK` when present. Environment names are matched case-insensitively on Windows. The controller
+(`SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `PATHEXT`, `NoDefaultCurrentDirectoryInExePath`; on
+Windows `soup` sets the last to 1 when it is not set, and the controller sets it to 1 for `ssh`
+and `scp`) and `SSH_AUTH_SOCK` when present. Environment names are matched case-insensitively on Windows. The controller
 reconfigures stdout/stderr to replace characters the pipe encoding cannot represent,
 because isolated Python ignores `PYTHONIOENCODING` and `PYTHONUTF8`.
 SSH/SCP use `IdentitiesOnly=yes` with the selected key and a temporary per-run known-hosts
@@ -1237,6 +1238,13 @@ controllers) by the absolute path found in an absolute `PATH` directory, searchi
 in order. Empty and relative `PATH` entries (`.`, `bin`, and on Windows `\bin` or `C:bin`) are not
 searched, and neither is the current directory. A program that is only in the current directory
 or in such an entry is not found: put the program's directory on `PATH` as an absolute path.
+On Windows `soup` also sets `NoDefaultCurrentDirectoryInExePath=1` for itself when it is not
+set, so a program started by bare name by Soup's libraries or by a program Soup starts (an eval
+or reward script included) is not looked for in the current directory either, as on Linux and
+macOS. A value already set is kept, and Windows leaves the current directory out for any
+non-empty value, `0` included, so no setting brings the old search back: to run a program from
+the current directory, give its path (`.\tool.exe`) or put the directory on `PATH` as an absolute
+path.
 
 
 ## Experiment Tracking
@@ -1380,7 +1388,7 @@ You can also explicitly disable telemetry for a specific invocation using the `-
 soup --no-telemetry train --config soup.yaml
 ```
 
-When enabled, telemetry performs a synchronous fire-and-forget HTTP POST with a 1-second connect and read timeout (DNS resolution excluded) on command exit. The anonymous identifier is stored at `~/.soup/telemetry_id`; deleting `~/.soup/telemetry_id` regenerates it on the next opt-in. See [Privacy Policy](#privacy-policy) for details.
+As released, opting in sends nothing: the bundled PostHog key is a placeholder, so the command prints `Notice: telemetry is not yet live.` and makes no network request. Only with an operator's own `SOUP_POSTHOG_KEY` (and optionally an HTTPS `SOUP_POSTHOG_ENDPOINT`) does telemetry perform a synchronous fire-and-forget HTTPS POST with a 1-second connect and read timeout (DNS resolution excluded) on command exit. The anonymous identifier is stored at `~/.soup/telemetry_id`; deleting `~/.soup/telemetry_id` regenerates it on the next opt-in. See [Privacy Policy](#privacy-policy) for details.
 
 
 ## Profiling Extras
@@ -1635,7 +1643,7 @@ Soup contains opt-in, hardware-info-only telemetry in `utils/trackers.py` (`buil
 
 ### Privacy Policy
 
-Soup's telemetry is strictly anonymous and hardware-focused. When opted in via `SOUP_TELEMETRY=1`, we collect only the following fields to understand what environments we need to support:
+Soup's telemetry is strictly anonymous and hardware-focused. When opted in via `SOUP_TELEMETRY=1`, the payload carries only the following fields to understand what environments we need to support (it is sent only with an operator's own `SOUP_POSTHOG_KEY`, see below):
 
 - `soup_version`: the version of Soup being run
 - `command`: the top-level command executed (e.g. `train`, `data`, validated against known commands; unknown commands or paths are masked as `(unknown)`)
@@ -1650,9 +1658,9 @@ We **NEVER** collect:
 - Model names or architectures
 - Config file contents or hyperparameters
 - Usernames, local file paths, or directory names
-- IP addresses, tokens, or credentials
+- IP addresses (the payload carries none; the receiving server sees the client address of any HTTPS request), tokens, or credentials
 
-All uploads use HTTPS, a 1-second connect and read timeout (DNS resolution excluded), and defensive SSRF validation. Any network or filesystem exception is silently swallowed so telemetry can never fail or interrupt your work.
+With the bundled placeholder key nothing is uploaded: an opted-in command prints `Notice: telemetry is not yet live.` and makes no request. With an operator's own `SOUP_POSTHOG_KEY`, uploads use HTTPS, a 1-second connect and read timeout (DNS resolution excluded), and defensive SSRF validation. Any network or filesystem exception is silently swallowed so telemetry can never fail or interrupt your work.
 
 
 ## Plugin System

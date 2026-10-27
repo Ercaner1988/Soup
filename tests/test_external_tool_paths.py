@@ -370,6 +370,24 @@ class TestFilteredEnvironment:
         assert "PATH" in _folded(env)
         assert "SOUP_PROBE_VARIABLE" not in _folded(env)
 
+    def test_windows_children_skip_the_current_directory_too(self):
+        environ = {"PATH": "C:\\bin", "LANG": "C"}
+
+        env = filtered_environment((), environ)
+
+        if _WINDOWS:
+            assert env == {"PATH": "C:\\bin", "NoDefaultCurrentDirectoryInExePath": "1"}
+        else:
+            assert env == {"PATH": "C:\\bin"}
+
+    @windows_only
+    def test_another_spelling_of_the_setting_is_replaced(self):
+        environ = {"Path": "C:\\bin", "nodefaultcurrentdirectoryinexepath": "0"}
+
+        env = filtered_environment((), environ)
+
+        assert env == {"Path": "C:\\bin", "NoDefaultCurrentDirectoryInExePath": "1"}
+
 
 class TestToolEnvironment:
     def test_the_named_variables_are_left_out_ignoring_case(self):
@@ -396,6 +414,104 @@ class TestToolEnvironment:
 
     def test_the_result_is_a_new_mapping(self):
         assert tool_environment() is not os.environ
+
+
+_NO_CWD = "NoDefaultCurrentDirectoryInExePath"
+
+_START_BY_BARE_NAME = """
+import subprocess, sys
+if sys.argv[1] == "exclude":
+    from soup_cli.utils.tool_paths import exclude_current_directory_from_program_search
+    exclude_current_directory_from_program_search()
+try:
+    subprocess.run(["soupcwdprobe"], capture_output=True, check=False, timeout=60)
+except FileNotFoundError:
+    print("not found")
+else:
+    print("started")
+"""
+
+
+def _unset_for_this_test(monkeypatch, name: str) -> None:
+    """Remove ``name`` from the environment; teardown removes it again whether
+    or not it was set before the test."""
+    monkeypatch.setenv(name, "placeholder")
+    monkeypatch.delenv(name)
+
+
+def _values_seen_by_the_command(monkeypatch) -> list[str | None]:
+    """Run ``soup version`` through ``cli.run()`` with the command replaced, and
+    return the value of the variable each time the command was called."""
+    from soup_cli import cli
+
+    seen: list[str | None] = []
+
+    def app():
+        seen.append(os.environ.get(_NO_CWD))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli, "app", app)
+    monkeypatch.setattr(cli, "_emit_audit_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_emit_telemetry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["soup", "version"])
+
+    with pytest.raises(SystemExit):
+        cli.run()
+
+    return seen
+
+
+windows_setting_only = pytest.mark.skipif(
+    not _WINDOWS,
+    reason="NoDefaultCurrentDirectoryInExePath is read only by Windows; elsewhere soup leaves it "
+    "alone (test_soup_sets_the_variable_for_itself_on_windows checks that)",
+)
+
+
+class TestSoupLeavesTheCurrentDirectoryOutOfItsProgramSearch:
+    def test_soup_sets_the_variable_for_itself_on_windows(self, monkeypatch):
+        _unset_for_this_test(monkeypatch, _NO_CWD)
+
+        seen = _values_seen_by_the_command(monkeypatch)
+
+        assert seen == (["1"] if _WINDOWS else [None])
+
+    @windows_setting_only
+    @pytest.mark.parametrize("spelling", [_NO_CWD, _NO_CWD.lower()])
+    def test_a_value_already_set_is_kept(self, monkeypatch, spelling):
+        monkeypatch.setenv(spelling, "0")
+
+        seen = _values_seen_by_the_command(monkeypatch)
+
+        assert seen == ["0"]
+        assert os.environ[_NO_CWD] == "0"
+        assert len([name for name in os.environ if name.upper() == _NO_CWD.upper()]) == 1
+
+    @windows_only
+    def test_a_program_only_in_the_current_directory_is_not_started_by_bare_name(
+        self, tmp_path
+    ):
+        import shutil
+
+        system_program = Path(os.environ.get("SYSTEMROOT", "C:\\Windows"), "System32", "whoami.exe")
+        if not system_program.is_file():
+            pytest.skip(f"{system_program} is not there to copy")
+        shutil.copyfile(system_program, tmp_path / "soupcwdprobe.exe")
+        env = {name: value for name, value in os.environ.items() if name.upper() != _NO_CWD.upper()}
+        env["PYTHONPATH"] = str(Path(tool_paths.__file__).resolve().parents[2])
+
+        def outcome(mode: str) -> str:
+            completed = subprocess.run(
+                [sys.executable, "-P", "-c", _START_BY_BARE_NAME, mode],
+                cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120, check=False,
+            )
+            assert completed.returncode == 0, completed.stderr
+            return completed.stdout.strip()
+
+        # Without the setting Windows starts the copy in the current directory ...
+        assert outcome("keep") == "started"
+        # ... and with it the bare name is not found there.
+        assert outcome("exclude") == "not found"
 
 
 def _with_the_four(monkeypatch) -> None:

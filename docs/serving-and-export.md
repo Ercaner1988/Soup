@@ -910,7 +910,7 @@ closed allowlist / filtered-env rules as the other `soup llama` subcommands). Us
 it when you already have a GGUF and want llama.cpp's quantizer directly, rather
 than going through `soup export --format gguf` / `soup quantize`.
 
-Closed allowlist: `cli` / `mtmd-cli` / `gguf-split` / `server` / `quantize`. Forwards to the `llama-*` binary found in an absolute `PATH` directory (empty and relative entries and the current directory are not searched) with a **filtered child env** — `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and other secrets are dropped before exec; only `PATH` / `PATHEXT` / `SYSTEMROOT` / `NoDefaultCurrentDirectoryInExePath`, `HOME` / `USER` / `USERPROFILE` / `TMP` / `TEMP`, locale (`LANG` / `LC_ALL` / `LC_CTYPE`), `TERM` / `COLORTERM` and the llama.cpp-recognised `LLAMA_CPP_HOME` / `GGML_CUDA` / `GGML_METAL` / `OMP_NUM_THREADS` are forwarded. Names are matched without regard to case on Windows.
+Closed allowlist: `cli` / `mtmd-cli` / `gguf-split` / `server` / `quantize`. Forwards to the `llama-*` binary found in an absolute `PATH` directory (empty and relative entries and the current directory are not searched) with a **filtered child env** — `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and other secrets are dropped before exec; only `PATH` / `PATHEXT` / `SYSTEMROOT` / `NoDefaultCurrentDirectoryInExePath` (on Windows set to 1 for the child, whatever the parent has), `HOME` / `USER` / `USERPROFILE` / `TMP` / `TEMP`, locale (`LANG` / `LC_ALL` / `LC_CTYPE`), `TERM` / `COLORTERM` and the llama.cpp-recognised `LLAMA_CPP_HOME` / `GGML_CUDA` / `GGML_METAL` / `OMP_NUM_THREADS` are forwarded. Names are matched without regard to case on Windows.
 
 
 ## Tail-Latency Stats + Tool-Call Timer
@@ -1062,6 +1062,13 @@ Three POST routes are now available on `soup serve`:
   sending signals only to the run itself. Run
   `soup serve` in a container, a VM or under a dedicated unprivileged account for any
   caller you do not fully trust.
+  Returns the real stdout, stderr, exit code, and timeout state. A timeout returns
+  `timed_out: true` and `exit_code: 124`; an output overflow returns
+  `timed_out: false` and `exit_code: 1`. Other process failures retain their exit
+  code and report `timed_out: false`. The combined stdout/stderr cap is 10 KB.
+  Python line numbers include the six-line network-guard prefix: the caller's
+  first line is reported as line 7. Tool authentication failures return HTTP 401
+  with `WWW-Authenticate: Bearer`.
 - **`POST /v1/tools/web_search`** — searches the web and returns domain-filtered results
   as `[{url, title, snippet}]` with snippets sanitized (null bytes stripped).
   Deny-by-default via `WebSearchConfig.domain_allowlist`.

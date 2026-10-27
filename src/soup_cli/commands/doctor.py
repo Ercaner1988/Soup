@@ -330,7 +330,8 @@ def doctor(
 
     loaded_cfg = None
     if config:
-        # Load and validate the config before the environment summary (#2100).
+        # Load and validate the config before the "All checks passed!" line (#2100);
+        # the environment tables above have already printed.
         # If the config is refused or cannot be loaded, doctor terminates with exit 2
         # before asserting that "All checks passed!".
         loaded_cfg = _load_doctor_config(config)
